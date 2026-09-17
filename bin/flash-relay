@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""flash-relay - standalone GLM-5.3-Flash computer-use driver.
+
+Drives the real X11 desktop via the lcu CLI, with the model called directly
+over the Anthropic-compatible GLM API. Bypasses the zcode subagent registry
+entirely, so it works regardless of desktop-side provider state.
+
+Protocol carried in code, not prompt-hope:
+  - hard action cap (default 40) and wall-clock cap (default 480 s)
+  - vision gate: the first tool round MUST be a screenshot; if the model
+    cannot describe it, abort (blind runs are not allowed to continue)
+  - lcu-only actuation surface (plus a constrained bash tool for app launch
+    and file oracles)
+  - final output is the standing report template
+
+Usage: flash-relay.py <brief-file> [--max-actions N] [--timeout-s S]
+"""
+from __future__ import annotations
+
+import base64
+import http.client
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.parse
+
+LCU = os.environ.get("LCU_BIN", os.path.expanduser("~/.local/bin/lcu"))
+API = "https://api.z.ai/api/anthropic/v1/messages"
+MODEL = "GLM-5.3-Flash"
+
+TOOLS = [
+    {"name": "screenshot",
+     "description": "Capture the screen (or a window/region) and VIEW it. Use before every action; never act on a stale frame. Coordinates in region/window captures are relative: add region x/y.",
+      "input_schema": {"type": "object", "properties": {
+          "window": {"type": "string", "description": "'active', window id, or name substring. Omit for full screen."},
+          "region": {"type": "array", "items": {"type": "integer"}, "minItems": 4, "maxItems": 4, "description": "[x,y,w,h] absolute-screen crop (zoom for small targets)."},
+          "scale": {"type": "number", "description": "Downscale factor, e.g. 0.75. Divide image coords by it before clicking."}},
+      }},
+    {"name": "click", "description": "Click at absolute screen coordinates from the latest screenshot.",
+     "input_schema": {"type": "object", "required": ["x", "y"], "properties": {
+         "x": {"type": "integer"}, "y": {"type": "integer"},
+         "button": {"type": "string", "enum": ["left", "middle", "right"]},
+         "count": {"type": "integer", "description": "2 = double-click"}}}},
+    {"name": "type_text", "description": "Type literal text into the focused window. Focus the right window and click the field first.",
+     "input_schema": {"type": "object", "required": ["text"], "properties": {"text": {"type": "string"}}}},
+    {"name": "press_key", "description": "Press key combos, e.g. ctrl+s, Return, ctrl+w.",
+     "input_schema": {"type": "object", "required": ["keys"], "properties": {
+         "keys": {"type": "array", "items": {"type": "string"}}}}},
+    {"name": "scroll", "description": "Scroll the wheel.",
+     "input_schema": {"type": "object", "required": ["direction"], "properties": {
+         "direction": {"type": "string", "enum": ["up", "down", "left", "right"]},
+         "amount": {"type": "integer"}, "x": {"type": "integer"}, "y": {"type": "integer"}}}},
+    {"name": "drag", "description": "Press at (x1,y1), move, release at (x2,y2).",
+     "input_schema": {"type": "object", "required": ["x1", "y1", "x2", "y2"], "properties": {
+         "x1": {"type": "integer"}, "y1": {"type": "integer"}, "x2": {"type": "integer"}, "y2": {"type": "integer"}}}},
+    {"name": "list_windows", "description": "List visible windows with ids, titles, geometry.",
+     "input_schema": {"type": "object", "properties": {}}},
+    {"name": "focus_window", "description": "Activate/raise a window by 'active', id, or name substring. Do this before typing.",
+     "input_schema": {"type": "object", "required": ["window"], "properties": {"window": {"type": "string"}}}},
+    {"name": "bash", "description": "Run a shell command. ONLY for: launching the target app (backgrounded), reading files the GUI wrote (cat/ls), and other non-GUI parts the brief allows. Never for image processing, downloads, or anything on the FORBIDDEN list.",
+     "input_schema": {"type": "object", "required": ["command"], "properties": {"command": {"type": "string"}}}},
+]
+
+SYSTEM = """You are flash-worker, a computer-use worker driving the user's REAL X11 desktop through LCU tools. You execute exactly one bounded GUI subtask (given in the user message), then report. You never talk to the user directly.
+
+# Vision gate
+Your FIRST tool call must be a full screenshot. If you cannot actually see and describe its contents, STOP and output the report with STATUS: failed and ANOMALIES: "VISION-BROKEN: cannot view images". Never compensate with image processing, crops via bash, or OCR. A blind run must cost one screenshot.
+
+# The loop (strict)
+1. LOOK - screenshot before every single action. Never act on a stale frame.
+2. DECIDE - exactly one action that moves the subtask forward.
+3. ACT - issue it.
+4. VERIFY - screenshot again; confirm the expected change. If it did not happen, do not repeat the same action; re-observe, diagnose, change approach.
+
+# Accuracy discipline
+- Click coordinates only from the most recent screenshot. Recompute after any scroll, window change, or animation.
+- Small or ambiguous target: capture its region first, compute the coordinate there, offset by the region origin.
+- Before typing: focus the right window and click the exact field. After typing, verify the text landed.
+- Prefer keyboard navigation (Tab, arrows, shortcuts) when reliable.
+
+# Forms and irreplaceable state
+- NEVER navigate, reload, refresh, or close a browser tab that contains a filled but unsubmitted form. Open your target site in a NEW tab and leave every other tab exactly as found.
+- Verify typed values cheaply (field echo, tab order, one screenshot per form section). Per-field screenshot verification is not your job.
+
+# Hard prohibitions - report STATUS: needs-escalation instead of doing
+- Typing passwords, tokens, 2FA codes.
+- Sending/submitting anything with external effect: messages, emails, posts, orders, payments.
+- Deleting files; closing/resizing apps other than your target; sudo; system settings; anything irreversible.
+
+# Budget
+Hard cap: the action budget in the brief (default 40). Screenshots are free. Three failed attempts at one goal-step: STOP, report blocked. Do not thrash.
+
+# Report - your final message MUST be exactly this template
+STATUS: done | blocked | failed | needs-escalation
+STEPS: <number> total
+  - <one line per action, in order>
+EVIDENCE:
+  - <paths of key screenshots: initial, final>
+ANOMALIES: <unexpected things seen or done; "none" if none>
+RESULT: <one paragraph: end state and whether the brief's acceptance criteria are met>
+
+Be honest: the driver verifies every done claim independently."""
+
+
+def api_key() -> str:
+    # Primary: the CLI config provider record. Fallback: the ZCode desktop
+    # app's provider store, which is where a fresh install keeps its key.
+    for path, pick in (
+        ("~/.zcode/cli/config.json", lambda c: c["provider"]["zai-coding-plan"]["options"]["apiKey"]),
+        ("~/.zcode/v2/config.json", lambda c: c["provider"]["builtin:zai-coding-plan"]["options"]["apiKey"]),
+    ):
+        try:
+            return pick(json.load(open(os.path.expanduser(path))))
+        except (OSError, KeyError, json.JSONDecodeError):
+            continue
+    sys.exit("flash-relay: no Z.ai provider key found in ~/.zcode/cli/config.json "
+             "or ~/.zcode/v2/config.json (see README, Install)")
+
+
+def call_model(key: str, messages: list, thinking: bool, conn) -> dict:
+    body = {
+        "model": MODEL,
+        "max_tokens": 4096,
+        "system": [{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}],
+        "messages": messages,
+        "tools": TOOLS,
+    }
+    # Thinking (reasoning) costs 1.5-2.5s+ per call on this endpoint. The
+    # driving loop is reflexes-over-deliberation - the protocol enforces the
+    # discipline - so it is off unless --thinking is passed.
+    if not thinking:
+        body["thinking"] = {"type": "disabled"}
+    payload = json.dumps(body).encode()
+    headers = {
+        "x-api-key": key,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+        "content-length": str(len(payload)),
+    }
+    try:
+        conn.request("POST", urllib.parse.urlparse(API).path, body=payload, headers=headers)
+        with conn.getresponse() as resp:
+            data = resp.read()
+        if resp.status != 200:
+            return {"error": f"HTTP {resp.status}: {data[:300].decode(errors='replace')}"}
+        return json.loads(data)
+    except Exception as e:  # noqa: BLE001 - one retry on a fresh connection
+        try:
+            conn.close()
+            conn.connect()
+            conn.request("POST", urllib.parse.urlparse(API).path, body=payload, headers=headers)
+            with conn.getresponse() as resp:
+                data = resp.read()
+            if resp.status != 200:
+                return {"error": f"HTTP {resp.status}: {data[:300].decode(errors='replace')}"}
+            return json.loads(data)
+        except Exception as e2:  # noqa: BLE001 - surface transport faults to the loop
+            return {"error": f"transport: {e2}"}
+
+
+KEEP_LAST_IMAGES = 2
+
+
+def prune_old_images(messages: list) -> None:
+    """Replace all but the newest KEEP_LAST_IMAGES screenshot blocks with text
+    stubs. Old frames have no decision value (the protocol forbids acting on
+    stale frames) but their base64 payload otherwise rides along on every
+    subsequent request, growing latency linearly with run length."""
+    image_sites = []  # (message_index, block_index, path_hint)
+    for mi, m in enumerate(messages):
+        content = m.get("content")
+        if not isinstance(content, list):
+            continue
+        for bi, b in enumerate(content):
+            if isinstance(b, dict) and b.get("type") == "tool_result":
+                for ci, c in enumerate(b.get("content") or []):
+                    if isinstance(c, dict) and c.get("type") == "image":
+                        image_sites.append((mi, bi, ci))
+    for mi, bi, ci in image_sites[:-KEEP_LAST_IMAGES]:
+        block = messages[mi]["content"][bi]
+        stubs = []
+        for c in block["content"]:
+            if isinstance(c, dict) and c.get("type") == "image":
+                stubs.append({"type": "text", "text": "[earlier screenshot omitted from history; path was reported when taken]"})
+            else:
+                stubs.append(c)
+        block["content"] = stubs
+
+
+def lcu(*args: str) -> dict:
+    try:
+        proc = subprocess.run([LCU, *args], capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": "lcu timed out"}
+    for line in reversed((proc.stdout or "").splitlines()):
+        try:
+            return json.loads(line)
+        except json.JSONDecodeError:
+            continue
+    return {"ok": False, "error": (proc.stderr or proc.stdout or "no output")[:300]}
+
+
+def do_screenshot(a: dict) -> list:
+    args = ["screenshot"]
+    if a.get("window"):
+        args += ["--window", str(a["window"])]
+    if a.get("region"):
+        args += ["--region", *[str(v) for v in a["region"]]]
+    if a.get("scale") and a["scale"] != 1.0:
+        args += ["--scale", str(a["scale"])]
+    res = lcu(*args)
+    if not res.get("ok"):
+        return [{"type": "text", "text": f"screenshot failed: {res.get('error')}"}]
+    path = res["path"]
+    size = os.path.getsize(path)
+    if size > 4_000_000:
+        return [{"type": "text", "text": f"screenshot too large ({size} bytes); retry with scale. Saved {path}"}]
+    with open(path, "rb") as fh:
+        data = base64.b64encode(fh.read()).decode()
+    meta = {k: v for k, v in res.items() if k not in ("ok", "path")}
+    return [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}},
+            {"type": "text", "text": path + " " + json.dumps(meta)}]
+
+
+def run_tool(name: str, a: dict) -> tuple[list, bool]:
+    """Execute a tool; returns (content blocks, counts_as_action)."""
+    if name == "screenshot":
+        return do_screenshot(a), False
+    if name == "click":
+        res = lcu("click", str(a["x"]), str(a["y"]), "--button", a.get("button", "left"),
+                  "--count", str(a.get("count", 1)))
+    elif name == "type_text":
+        res = lcu("type", a["text"])
+    elif name == "press_key":
+        res = lcu("key", *[str(k) for k in a["keys"]])
+    elif name == "scroll":
+        args = ["scroll", a["direction"], str(a.get("amount", 3))]
+        if a.get("x") is not None and a.get("y") is not None:
+            args += ["--x", str(a["x"]), "--y", str(a["y"])]
+        res = lcu(*args)
+    elif name == "drag":
+        res = lcu("drag", str(a["x1"]), str(a["y1"]), str(a["x2"]), str(a["y2"]))
+    elif name == "list_windows":
+        res = lcu("windows")
+    elif name == "focus_window":
+        res = lcu("focus", str(a["window"]))
+    elif name == "bash":
+        proc = subprocess.run(a["command"], shell=True, capture_output=True, text=True, timeout=60)
+        res = {"ok": proc.returncode == 0, "stdout": proc.stdout[-1500:], "stderr": proc.stderr[-500:]}
+    else:
+        res = {"ok": False, "error": f"unknown tool {name}"}
+    return [{"type": "text", "text": json.dumps(res)[:1500]}], name != "list_windows"
+
+
+def main() -> int:
+    brief_path = sys.argv[1] if len(sys.argv) > 1 else None
+    if not brief_path or not os.path.exists(brief_path):
+        print("usage: flash-relay.py <brief-file> [--max-actions N] [--timeout-s S] [--thinking]", file=sys.stderr)
+        return 2
+    max_actions, timeout_s = 40, 480
+    thinking = False
+    argv = sys.argv[2:]
+    if "--max-actions" in argv:
+        max_actions = int(argv[argv.index("--max-actions") + 1])
+    if "--timeout-s" in argv:
+        timeout_s = int(argv[argv.index("--timeout-s") + 1])
+    if "--thinking" in argv:
+        thinking = True
+
+    brief = open(brief_path).read().strip()
+    key = api_key()
+    host = urllib.parse.urlparse(API).netloc
+    conn = http.client.HTTPSConnection(host, timeout=180)
+    messages = [{"role": "user", "content": brief}]
+    actions, t0, rounds = 0, time.time(), 0
+
+    while rounds < 60 and time.time() - t0 < timeout_s:
+        prune_old_images(messages)
+        resp = call_model(key, messages, thinking, conn)
+        rounds += 1
+        if resp.get("error") or resp.get("type") == "error":
+            print(f"DRIVER: API error: {json.dumps(resp)[:400]}")
+            print("STATUS: failed\nSTEPS: %d\nEVIDENCE: n/a\nANOMALIES: API error after %d actions\nRESULT: run aborted on API failure" % (actions, actions))
+            return 1
+        content = resp.get("content", [])
+        messages.append({"role": "assistant", "content": content})
+        tool_uses = [b for b in content if b.get("type") == "tool_use"]
+        texts = [b.get("text", "") for b in content if b.get("type") == "text"]
+        if not tool_uses:
+            print("\n".join(t for t in texts if t))
+            return 0
+        results = []
+        for tu in tool_uses:
+            blocks, is_action = run_tool(tu["name"], tu.get("input") or {})
+            if is_action:
+                actions += 1
+            results.append({"type": "tool_result", "tool_use_id": tu["id"], "content": blocks})
+        messages.append({"role": "user", "content": results})
+        if actions >= max_actions:
+            messages.append({"role": "user", "content":
+                "DRIVER: action budget reached (%d). Stop acting now and output your final report." % actions})
+        if time.time() - t0 > timeout_s - 30:
+            messages.append({"role": "user", "content":
+                "DRIVER: wall-clock budget nearly exhausted. Output your final report now."})
+    print("DRIVER: budget/rounds exhausted without a final report.")
+    print("STATUS: blocked\nSTEPS: %d\nEVIDENCE: n/a\nANOMALIES: driver budget exhausted\nRESULT: no final report produced" % actions)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

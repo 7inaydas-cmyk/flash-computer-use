@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""lcu - Linux Computer Use.
+
+A minimal computer-use surface for X11 built on xdotool (input) and
+ffmpeg x11grab (capture). Designed to be driven by an AI agent over a
+shell: every subcommand prints a single machine-readable JSON line.
+
+Primitives: see (screenshot), point (move/click/drag/scroll), type (text/keys),
+and window management.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+SHOT_DIR = os.environ.get("LCU_SHOT_DIR", os.path.expanduser("~/.cache/lcu"))
+DISPLAY = os.environ.get("DISPLAY", ":0")
+
+
+def die(msg: str, code: int = 1):
+    print(json.dumps({"ok": False, "error": msg}))
+    sys.exit(code)
+
+
+def emit(**kw):
+    print(json.dumps({"ok": True, **kw}))
+
+
+def run(cmd: list[str], check: bool = True) -> str:
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if check and proc.returncode != 0:
+        die(f"{cmd[0]} failed: {(proc.stderr or proc.stdout).strip()[:400]}")
+    return proc.stdout.strip()
+
+
+def need(binary: str):
+    if not shutil.which(binary):
+        die(f"required tool not installed: {binary}")
+
+
+def screen_size() -> tuple[int, int]:
+    out = run(["xdpyinfo"])
+    m = re.search(r"dimensions:\s+(\d+)x(\d+)", out)
+    if not m:
+        die("could not read screen dimensions from xdpyinfo")
+    return int(m.group(1)), int(m.group(2))
+
+
+# --- see ---------------------------------------------------------------
+
+def cmd_screenshot(args):
+    need("ffmpeg")
+    os.makedirs(SHOT_DIR, exist_ok=True)
+    w, h = screen_size()
+    path = args.out or os.path.join(SHOT_DIR, f"shot-{int(time.time() * 1000)}.png")
+
+    geom = f"{w}x{h}"
+    grab = f"{DISPLAY}+0,0"
+    region = None
+    if args.window and args.region:
+        die("--window and --region are mutually exclusive")
+    if args.region:
+        rx, ry, rw, rh = args.region
+        if rw <= 0 or rh <= 0 or rx < 0 or ry < 0 or rx + rw > w or ry + rh > h:
+            die(f"region {list(args.region)} out of bounds for {w}x{h}")
+        geom = f"{rw}x{rh}"
+        grab = f"{DISPLAY}+{rx},{ry}"
+        region = {"x": rx, "y": ry, "width": rw, "height": rh}
+    if args.window:
+        wid = resolve_window(args.window)
+        info = window_geometry(wid)
+        # GTK client-side decorations report shadow offsets that can fall off
+        # screen; x11grab rejects negative origins and out-of-bounds sizes.
+        info["x"] = max(0, info["x"])
+        info["y"] = max(0, info["y"])
+        info["width"] = min(info["width"], w - info["x"])
+        info["height"] = min(info["height"], h - info["y"])
+        geom = f"{info['width']}x{info['height']}"
+        grab = f"{DISPLAY}+{info['x']},{info['y']}"
+        region = info
+
+    if args.delay:
+        time.sleep(args.delay)
+
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+           "-f", "x11grab", "-video_size", geom, "-i", grab, "-frames:v", "1"]
+    if args.scale and args.scale != 1.0:
+        cmd += ["-vf", f"scale=iw*{args.scale}:ih*{args.scale}"]
+    cmd += [path]
+    run(cmd)
+
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        die("screenshot produced no output")
+
+    out = {"path": path, "screen": {"width": w, "height": h},
+           "bytes": os.path.getsize(path)}
+    if args.scale and args.scale != 1.0:
+        out["scale"] = args.scale
+        out["note"] = (f"image is scaled {args.scale}x; divide image coords by "
+                       f"{args.scale} to get real screen coords")
+    if region:
+        out["region"] = region
+        out["note"] = ("coords in this image are capture-relative; add region x/y "
+                       "for absolute screen coords")
+    emit(**out)
+
+
+# --- windows -----------------------------------------------------------
+
+def window_geometry(wid: str) -> dict:
+    out = run(["xdotool", "getwindowgeometry", "--shell", wid])
+    vals = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+    return {"x": int(vals["X"]), "y": int(vals["Y"]),
+            "width": int(vals["WIDTH"]), "height": int(vals["HEIGHT"])}
+
+
+def resolve_window(spec: str) -> str:
+    """Accept 'active', a numeric window id, or a name substring."""
+    if spec == "active":
+        return run(["xdotool", "getactivewindow"])
+    if spec.isdigit():
+        return spec
+    out = run(["xdotool", "search", "--name", spec], check=False)
+    ids = [line for line in out.splitlines() if line.strip()]
+    if not ids:
+        die(f"no window matching name: {spec}")
+    return ids[-1]
+
+
+def cmd_windows(args):
+    need("xdotool")
+    out = run(["xdotool", "search", "--onlyvisible", "--name", ".*"], check=False)
+    active = run(["xdotool", "getactivewindow"], check=False)
+    wins = []
+    for wid in out.splitlines():
+        wid = wid.strip()
+        if not wid:
+            continue
+        name = run(["xdotool", "getwindowname", wid], check=False)
+        if not name:
+            continue
+        try:
+            geo = window_geometry(wid)
+        except SystemExit:
+            continue
+        if geo["width"] < 40 or geo["height"] < 40:
+            continue
+        wins.append({"id": wid, "name": name, "active": wid == active, **geo})
+    emit(windows=wins, count=len(wins))
+
+
+def cmd_focus(args):
+    need("xdotool")
+    wid = resolve_window(args.window)
+    run(["xdotool", "windowactivate", "--sync", wid])
+    time.sleep(0.3)
+    emit(focused=wid, name=run(["xdotool", "getwindowname", wid], check=False))
+
+
+# --- point -------------------------------------------------------------
+
+def cmd_move(args):
+    need("xdotool")
+    run(["xdotool", "mousemove", str(args.x), str(args.y)])
+    emit(moved={"x": args.x, "y": args.y})
+
+
+def cmd_click(args):
+    need("xdotool")
+    btn = {"left": "1", "middle": "2", "right": "3"}[args.button]
+    cmd = ["xdotool"]
+    if args.x is not None and args.y is not None:
+        cmd += ["mousemove", str(args.x), str(args.y)]
+    cmd += ["click", "--repeat", str(args.count), "--delay", "80", btn]
+    run(cmd)
+    time.sleep(args.settle)
+    emit(clicked={"x": args.x, "y": args.y, "button": args.button,
+                  "count": args.count})
+
+
+def cmd_drag(args):
+    need("xdotool")
+    run(["xdotool", "mousemove", str(args.x1), str(args.y1)])
+    run(["xdotool", "mousedown", "1"])
+    steps = 24
+    for i in range(1, steps + 1):
+        run(["xdotool", "mousemove",
+             str(int(args.x1 + (args.x2 - args.x1) * i / steps)),
+             str(int(args.y1 + (args.y2 - args.y1) * i / steps))])
+        time.sleep(0.012)
+    run(["xdotool", "mouseup", "1"])
+    time.sleep(args.settle)
+    emit(dragged={"from": [args.x1, args.y1], "to": [args.x2, args.y2]})
+
+
+def cmd_scroll(args):
+    need("xdotool")
+    btn = "4" if args.direction == "up" else "5"
+    if args.direction in ("left", "right"):
+        btn = "6" if args.direction == "left" else "7"
+    cmd = ["xdotool"]
+    if args.x is not None and args.y is not None:
+        cmd += ["mousemove", str(args.x), str(args.y)]
+    cmd += ["click", "--repeat", str(args.amount), "--delay", "40", btn]
+    run(cmd)
+    time.sleep(args.settle)
+    emit(scrolled={"direction": args.direction, "amount": args.amount})
+
+
+def cmd_cursor(args):
+    need("xdotool")
+    out = run(["xdotool", "getmouselocation", "--shell"])
+    vals = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+    emit(cursor={"x": int(vals["X"]), "y": int(vals["Y"]),
+                 "window": vals.get("WINDOW")})
+
+
+# --- type --------------------------------------------------------------
+
+def cmd_type(args):
+    need("xdotool")
+    run(["xdotool", "type", "--delay", str(args.delay), "--", args.text])
+    time.sleep(args.settle)
+    emit(typed_chars=len(args.text))
+
+
+def cmd_key(args):
+    need("xdotool")
+    for combo in args.keys:
+        run(["xdotool", "key", "--delay", "60", combo])
+    time.sleep(args.settle)
+    emit(keys=args.keys)
+
+
+# --- cli ---------------------------------------------------------------
+
+def main():
+    p = argparse.ArgumentParser(prog="lcu", description="Linux Computer Use (X11)")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def settle(sp, default=0.4):
+        sp.add_argument("--settle", type=float, default=default,
+                        help="seconds to wait after the action")
+
+    s = sub.add_parser("screenshot", help="capture the screen or a window")
+    s.add_argument("--out")
+    s.add_argument("--scale", type=float, default=1.0)
+    s.add_argument("--window", help="'active', a window id, or a name substring")
+    s.add_argument("--region", type=int, nargs=4, metavar=("X", "Y", "W", "H"),
+                   help="capture only this absolute-screen rectangle (zoom for small targets)")
+    s.add_argument("--delay", type=float, default=0.0)
+    s.set_defaults(func=cmd_screenshot)
+
+    s = sub.add_parser("windows", help="list visible windows")
+    s.set_defaults(func=cmd_windows)
+
+    s = sub.add_parser("focus", help="activate a window")
+    s.add_argument("window")
+    s.set_defaults(func=cmd_focus)
+
+    s = sub.add_parser("move", help="move the pointer")
+    s.add_argument("x", type=int)
+    s.add_argument("y", type=int)
+    s.set_defaults(func=cmd_move)
+
+    s = sub.add_parser("click", help="click, optionally at x y")
+    s.add_argument("x", type=int, nargs="?")
+    s.add_argument("y", type=int, nargs="?")
+    s.add_argument("--button", choices=["left", "middle", "right"], default="left")
+    s.add_argument("--count", type=int, default=1)
+    settle(s)
+    s.set_defaults(func=cmd_click)
+
+    s = sub.add_parser("drag", help="press, move, release")
+    for a in ("x1", "y1", "x2", "y2"):
+        s.add_argument(a, type=int)
+    settle(s)
+    s.set_defaults(func=cmd_drag)
+
+    s = sub.add_parser("scroll", help="scroll the wheel")
+    s.add_argument("direction", choices=["up", "down", "left", "right"])
+    s.add_argument("amount", type=int, nargs="?", default=3)
+    s.add_argument("--x", type=int)
+    s.add_argument("--y", type=int)
+    settle(s)
+    s.set_defaults(func=cmd_scroll)
+
+    s = sub.add_parser("cursor", help="report pointer position")
+    s.set_defaults(func=cmd_cursor)
+
+    s = sub.add_parser("type", help="type literal text")
+    s.add_argument("text")
+    s.add_argument("--delay", type=int, default=12, help="ms between keystrokes")
+    settle(s)
+    s.set_defaults(func=cmd_type)
+
+    s = sub.add_parser("key", help="press key combos, e.g. ctrl+s Return")
+    s.add_argument("keys", nargs="+")
+    settle(s)
+    s.set_defaults(func=cmd_key)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

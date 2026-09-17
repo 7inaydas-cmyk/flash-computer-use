@@ -1,0 +1,20 @@
+SUBTASK: Prove the flash-relay computer-use stack end to end by creating a file through the GUI text editor.
+
+APP: GNOME Text Editor (gedit works the same). If an editor window is already open with your own document, do NOT touch it. Launch a NEW instance with the bash tool: nohup gnome-text-editor --new-window </dev/null >/dev/null 2>&1 &
+then wait about 2 seconds and screenshot to see the new untitled window.
+
+STEPS_HINT (you re-plan from screenshots; this is only a hint):
+1. In the NEW untitled window, type the exact sentence from EXACT_TEXT.
+2. Press ctrl+s to open the save dialog.
+3. In the save dialog, click into the Name field, clear it if needed, type the full path from ACCEPTANCE, press Return.
+4. Confirm the dialog closed and the window title shows the filename.
+5. Close YOUR window with ctrl+w (twice if an empty shell window remains).
+6. Verify with the bash tool: cat /tmp/flash-smoke-test.txt
+
+EXACT_TEXT: flash relay smoke test ok
+
+ACCEPTANCE: /tmp/flash-smoke-test.txt exists and contains exactly the sentence "flash relay smoke test ok". Any pre-existing editor window is untouched.
+
+FORBIDDEN: touching any pre-existing editor window; opening any application other than your own editor instance; navigating the save dialog beyond typing the absolute path.
+
+ACTION_BUDGET: 40
