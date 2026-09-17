@@ -1,0 +1,37 @@
+name: ci
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shell syntax
+        run: |
+          set -e
+          find . -name "*.sh" -not -path "./.git/*" -exec bash -n {} \;
+      - name: python syntax
+        run: |
+          set -e
+          python3 -m py_compile mcp/lcu-mcp-server.py
+          python3 - <<'EOF'
+          import ast, sys
+          for path in ("bin/flash-relay", "tests/test_lcu.py", "tests/test_flash_relay.py", "tests/test_docs.py"):
+              ast.parse(open(path).read(), filename=path)
+          print("python syntax ok:", "checked 4 files")
+          EOF
+
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install X11 tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xvfb xdotool ffmpeg x11-utils
+      - name: unit and integration tests
+        run: |
+          xvfb-run -a python3 -m unittest discover -s tests -v

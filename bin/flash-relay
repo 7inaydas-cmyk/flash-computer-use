@@ -139,25 +139,30 @@ def call_model(key: str, messages: list, thinking: bool, conn) -> dict:
         "content-type": "application/json",
         "content-length": str(len(payload)),
     }
-    try:
-        conn.request("POST", urllib.parse.urlparse(API).path, body=payload, headers=headers)
-        with conn.getresponse() as resp:
-            data = resp.read()
-        if resp.status != 200:
-            return {"error": f"HTTP {resp.status}: {data[:300].decode(errors='replace')}"}
-        return json.loads(data)
-    except Exception as e:  # noqa: BLE001 - one retry on a fresh connection
+    # Retry with backoff on transient faults: transport errors, 429, and
+    # 5xx. A driving loop dies to these otherwise; three attempts at 2/4/8s
+    # ride out normal rate-limit windows.
+    last_error = "no attempts made"
+    for attempt in range(3):
+        if attempt:
+            time.sleep(2 ** attempt)
         try:
-            conn.close()
-            conn.connect()
             conn.request("POST", urllib.parse.urlparse(API).path, body=payload, headers=headers)
             with conn.getresponse() as resp:
                 data = resp.read()
-            if resp.status != 200:
-                return {"error": f"HTTP {resp.status}: {data[:300].decode(errors='replace')}"}
-            return json.loads(data)
-        except Exception as e2:  # noqa: BLE001 - surface transport faults to the loop
-            return {"error": f"transport: {e2}"}
+            if resp.status == 200:
+                return json.loads(data)
+            last_error = f"HTTP {resp.status}: {data[:300].decode(errors='replace')}"
+            if resp.status != 429 and resp.status < 500:
+                return {"error": last_error}
+        except Exception as e:  # noqa: BLE001 - reconnect and retry transports
+            last_error = f"transport: {e}"
+            try:
+                conn.close()
+                conn.connect()
+            except Exception:  # noqa: BLE001 - next attempt will report it
+                pass
+    return {"error": last_error}
 
 
 KEEP_LAST_IMAGES = 2

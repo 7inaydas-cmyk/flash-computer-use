@@ -77,9 +77,8 @@ ZCode so the profile, skill, and MCP server register.
 Validate the install before trusting it:
 
 ```bash
-lcu windows                 # should print a JSON window list
-zcode skills list           # should show flash-computer-use
-flash-relay examples/brief-editor-smoke.txt   # full loop, ~3 minutes
+scripts/validate.sh                            # non-GUI checks, one PASS line each
+flash-relay examples/brief-editor-smoke.txt    # full loop, ~3 minutes
 ```
 
 ## Usage
