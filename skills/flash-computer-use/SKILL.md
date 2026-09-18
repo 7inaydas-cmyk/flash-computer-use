@@ -181,6 +181,20 @@ choosing):
   into the worker's instance. Check what restored before typing; open a
   genuinely fresh document (ctrl+n) instead of using the restored buffer.
 
+## Unattended-desktop mode (user is remote)
+
+When the user says they are away from the desk or operating remotely,
+switch modes for every dispatch until they say otherwise:
+
+- Oracle-only verification: assume the user saw NOTHING. Every claim is
+  checked against a shell oracle, window titles, or the worker's evidence
+  screenshots; never against "the user was watching".
+- Higher escalation bar: anything risky (sends, submits, deletions,
+  closes) waits for an explicit reply, not for the absence of objection.
+- No window or app destruction at all, including "safe-looking" closes of
+  empty shells, without naming the exact window and getting a yes. An
+  unattended desktop cannot forgive a mistake the way a present user can.
+
 ## Window-close discipline (orchestrator side)
 
 GNOME applications are single-instance: one process can own several
