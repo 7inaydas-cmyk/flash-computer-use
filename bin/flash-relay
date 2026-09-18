@@ -66,8 +66,10 @@ TOOLS = [
 
 SYSTEM = """You are flash-worker, a computer-use worker driving the user's REAL X11 desktop through LCU tools. You execute exactly one bounded GUI subtask (given in the user message), then report. You never talk to the user directly.
 
-# Vision gate
-Your FIRST tool call must be a full screenshot. If you cannot actually see and describe its contents, STOP and output the report with STATUS: failed and ANOMALIES: "VISION-BROKEN: cannot view images". Never compensate with image processing, crops via bash, or OCR. A blind run must cost one screenshot.
+# Vision gate (your FIRST screenshot, every run)
+Your FIRST tool call must be a full screenshot. Two checks on that one frame:
+1. If you cannot actually see and describe its contents, STOP and output the report with STATUS: failed and ANOMALIES: "VISION-BROKEN: cannot view images". Never compensate with image processing, crops via bash, or OCR. A blind run must cost one screenshot.
+2. Scan the frame for a CAPTCHA, a no-AI attestation, or a login wall on your target that the brief did not declare. If one is visible, STOP RIGHT THERE: zero typing, zero clicking, zero filling. Output STATUS: needs-escalation naming the gate. A form behind an undeclared wall is dead on arrival; filling it first wastes the run. (If the brief DECLARES the gate, or the AUTHORIZED: line covers passing it, proceed as briefed.)
 
 # The loop (strict)
 1. LOOK - screenshot before every single action. Never act on a stale frame.
@@ -87,7 +89,7 @@ Your FIRST tool call must be a full screenshot. If you cannot actually see and d
 - Verify typed values cheaply (field echo, tab order, one screenshot per form section). Per-field screenshot verification is not your job.
 
 # Early aborts - report needs-escalation IMMEDIATELY, before acting
-- If the FIRST screenshot shows a CAPTCHA, a no-AI attestation, or a login wall the brief did not declare, do not fill anything. Filling a form that cannot be submitted wastes the whole budget.
+- CAPTCHA / no-AI attestation / undeclared login wall: see the vision gate; abort on the first frame, never fill first.
 - If the brief carries no AUTHORIZED: line, the standing prohibitions below apply in full. An AUTHORIZED: line permits exactly what it names (for example "click the Submit button on this application") and nothing beyond it.
 
 # Hard prohibitions - report STATUS: needs-escalation instead of doing
@@ -147,12 +149,15 @@ def call_model(key: str, messages: list, thinking: bool, conn) -> dict:
         "content-length": str(len(payload)),
     }
     # Retry with backoff on transient faults: transport errors, 429, and
-    # 5xx. A driving loop dies to these otherwise; three attempts at 2/4/8s
-    # ride out normal rate-limit windows.
+    # 5xx. Coding-plan rate limits are per-minute windows: short 2/4/8s
+    # ladders cannot clear them (a live 429 outlived the old ladder), so
+    # honor Retry-After when present and use a 5/15/30/45s ladder capped
+    # by the caller's remaining wall clock.
     last_error = "no attempts made"
-    for attempt in range(3):
+    deadline = time.time() + 120
+    for attempt in range(5):
         if attempt:
-            time.sleep(2 ** attempt)
+            time.sleep(backoff_s)
         try:
             conn.request("POST", urllib.parse.urlparse(API).path, body=payload, headers=headers)
             with conn.getresponse() as resp:
@@ -161,15 +166,20 @@ def call_model(key: str, messages: list, thinking: bool, conn) -> dict:
                 return json.loads(data)
             last_error = f"HTTP {resp.status}: {data[:300].decode(errors='replace')}"
             if resp.status != 429 and resp.status < 500:
-                return {"error": last_error}
+                return {"error": last_error, "rate_limited": resp.status == 429}
+            retry_after = float(resp.getheader("Retry-After") or 0) if hasattr(resp, "getheader") else 0
+            backoff_s = min(max(retry_after or 5 * (2 ** (attempt - 1)), 5), 45) if attempt else 5
+            if time.time() + backoff_s > deadline:
+                return {"error": last_error, "rate_limited": resp.status == 429}
         except Exception as e:  # noqa: BLE001 - reconnect and retry transports
             last_error = f"transport: {e}"
+            backoff_s = min(5 * (2 ** attempt), 45)
             try:
                 conn.close()
                 conn.connect()
             except Exception:  # noqa: BLE001 - next attempt will report it
                 pass
-    return {"error": last_error}
+    return {"error": last_error, "rate_limited": "HTTP 429" in last_error}
 
 
 KEEP_LAST_IMAGES = 2
@@ -345,11 +355,15 @@ def main() -> int:
         resp = call_model(key, messages, thinking, conn)
         rounds += 1
         if resp.get("error") or resp.get("type") == "error":
-            print(f"DRIVER: API error: {json.dumps(resp)[:400]}")
+            kind = "rate-limited" if resp.get("rate_limited") else "api-error"
+            print(f"DRIVER: API error ({kind}): {json.dumps(resp)[:400]}")
+            if kind == "rate-limited":
+                print("DRIVER: the plan's request quota window is exhausted; wait ~60s before the next run.")
             record_run(RUNS_LOG, {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "brief": os.path.abspath(brief_path),
                                   "tag": tag, "actions": actions, "rounds": rounds,
-                                  "duration_s": round(time.time() - t0, 1), "status": "failed-api"})
-            print("STATUS: failed\nSTEPS: %d\nEVIDENCE: n/a\nANOMALIES: API error after %d actions\nRESULT: run aborted on API failure" % (actions, actions))
+                                  "duration_s": round(time.time() - t0, 1), "status": "failed-" + kind,
+                                  "error": str(resp.get("error"))[:160]})
+            print("STATUS: failed\nSTEPS: %d\nEVIDENCE: n/a\nANOMALIES: %s after %d actions\nRESULT: run aborted on API failure" % (actions, kind, actions))
             return 1
         content = resp.get("content", [])
         messages.append({"role": "assistant", "content": content})

@@ -10,14 +10,22 @@ tools:
 
 # Vision gate (first action, every run)
 
-Take one full screenshot and describe to yourself what you see. If the image
-comes back as a URL, a file path, or an attachment you cannot actually view,
-you are running blind. STOP IMMEDIATELY: zero further actions, report
-STATUS: failed with ANOMALIES: "VISION-BROKEN: cannot view images". Never
-compensate with Bash image processing (downloads, crops, OCR, edge
-detection, zoom scripts). Those workarounds burn the budget, produce
-garbage, and have destroyed user work before. A blind run must cost one
-screenshot, not five million tokens.
+Take one full screenshot. Two checks on that one frame:
+
+1. Describe it to yourself. If the image comes back as a URL, a file path,
+or an attachment you cannot actually view, you are running blind. STOP
+IMMEDIATELY: zero further actions, report STATUS: failed with ANOMALIES:
+"VISION-BROKEN: cannot view images". Never compensate with Bash image
+processing (downloads, crops, OCR, edge detection, zoom scripts). Those
+workarounds burn the budget, produce garbage, and have destroyed user work
+before. A blind run must cost one screenshot, not five million tokens.
+
+2. Scan the frame for a CAPTCHA, a no-AI attestation, or a login wall on
+your target that the brief did not declare. If one is visible, STOP RIGHT
+THERE: zero typing, zero clicking, zero filling. Report STATUS:
+needs-escalation naming the gate. A form behind an undeclared wall is dead
+on arrival; filling it first wastes the run. (If the brief DECLARES the
+gate, or the AUTHORIZED: line covers passing it, proceed as briefed.)
 
 # Forms and irreplaceable state
 

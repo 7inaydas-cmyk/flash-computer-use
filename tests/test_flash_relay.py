@@ -178,3 +178,69 @@ class SystemPromptGates(unittest.TestCase):
         for needle in ("CAPTCHA", "AUTHORIZED:", "FINDINGS:", "CONTINUE from it",
                        "VISION-BROKEN"):
             self.assertIn(needle, self.m.SYSTEM, needle)
+
+
+class RetryBackoff(unittest.TestCase):
+    """The 429 ladder, tested against a fake connection (no network)."""
+
+    def setUp(self):
+        self.m = load_module()
+        self.real_sleep = self.m.time.sleep
+        self.m.time.sleep = lambda s: None
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        self.m.time.sleep = self.real_sleep
+
+    class FakeResp:
+        def __init__(self, status, body=b'{"ok": true}', retry_after=None):
+            self.status = status
+            self._body = body
+            self._ra = retry_after
+        def read(self):
+            return self._body
+        def getheader(self, name):
+            return self._ra if name.lower() == "retry-after" else None
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    class FakeConn:
+        def __init__(self, script):
+            self.script = list(script)
+        def request(self, *a, **kw):
+            pass
+        def getresponse(self):
+            return self.script.pop(0)
+        def close(self):
+            pass
+        def connect(self):
+            pass
+
+    def test_429_then_success_retries_and_succeeds(self):
+        conn = self.FakeConn([self.FakeResp(429, b'{"type":"error"}', retry_after="1"),
+                              self.FakeResp(200)])
+        out = self.m.call_model("k", [{"role": "user", "content": "hi"}], False, conn)
+        self.assertEqual(out, {"ok": True})
+
+    def test_persistent_429_reports_rate_limited(self):
+        conn = self.FakeConn([self.FakeResp(429, b'{"type":"error"}')] * 5)
+        out = self.m.call_model("k", [{"role": "user", "content": "hi"}], False, conn)
+        self.assertTrue(out.get("rate_limited"))
+        self.assertIn("HTTP 429", out["error"])
+
+    def test_4xx_is_immediately_fatal_not_retried(self):
+        conn = self.FakeConn([self.FakeResp(401, b'{"type":"error"}')])
+        out = self.m.call_model("k", [{"role": "user", "content": "hi"}], False, conn)
+        self.assertIn("HTTP 401", out["error"])
+        self.assertFalse(out.get("rate_limited", False))
+        self.assertEqual(len(conn.script), 0)  # nothing left: no second attempt
+
+
+class FirstFrameGateWording(unittest.TestCase):
+    def test_captcha_scan_is_in_the_vision_gate(self):
+        m = load_module()
+        gate = m.SYSTEM.split("# The loop")[0]
+        self.assertIn("CAPTCHA", gate)
+        self.assertIn("zero typing, zero clicking, zero filling", gate)
