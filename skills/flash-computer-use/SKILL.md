@@ -181,6 +181,18 @@ choosing):
   into the worker's instance. Check what restored before typing; open a
   genuinely fresh document (ctrl+n) instead of using the restored buffer.
 
+## Window-close discipline (orchestrator side)
+
+GNOME applications are single-instance: one process can own several
+windows. Closing ONE window by id (xdotool windowclose) can end the
+process and destroy windows you never targeted, including the user's.
+Before closing any window by id, check how many windows its process owns
+(`ps -o pid= -C <app>` then match against `lcu windows` ids); if the app
+owns more than one, close via the app's own UI (ctrl+w inside that
+window) or not at all. Never assume "nobody else closed it" when a window
+you did not target disappears: your own earlier close is the first
+suspect, and the user may be nowhere near the desk.
+
 ## Worker report interpretation
 
 The worker's final message is `STATUS / STEPS / EVIDENCE / ANOMALIES /
