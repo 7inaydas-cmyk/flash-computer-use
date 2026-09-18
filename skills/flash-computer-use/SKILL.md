@@ -177,6 +177,9 @@ choosing):
   typed.
 - Long-idle forms expire mid-flight. If a submit returns to a blank or
   login page, report blocked with the evidence instead of refilling.
+- GNOME Text Editor's --new-window can RESTORE the user's saved drafts
+  into the worker's instance. Check what restored before typing; open a
+  genuinely fresh document (ctrl+n) instead of using the restored buffer.
 
 ## Worker report interpretation
 
