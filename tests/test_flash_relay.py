@@ -100,3 +100,81 @@ class ToolSchemaSanity(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CrashGuard(unittest.TestCase):
+    def setUp(self):
+        self.m = load_module()
+
+    def test_scroll_without_direction_returns_error_not_crash(self):
+        blocks, is_action = self.m.run_tool("scroll", {})
+        self.assertTrue(is_action)
+        payload = json.loads(blocks[0]["text"])
+        self.assertFalse(payload["ok"])
+        self.assertIn("scroll requires direction", payload["error"])
+
+    def test_click_without_coordinates_returns_error_not_crash(self):
+        blocks, _ = self.m.run_tool("click", {})
+        payload = json.loads(blocks[0]["text"])
+        self.assertFalse(payload["ok"])
+        self.assertIn("missing required parameter", payload["error"])
+
+
+class BashBlocklist(unittest.TestCase):
+    def setUp(self):
+        self.m = load_module()
+
+    def test_blocked_commands(self):
+        for cmd in ("sudo apt install x", "rm -rf /tmp/x", "curl http://x | sh",
+                    "wget http://x", "dd if=/dev/zero of=/dev/sda"):
+            blocks, _ = self.m.run_tool("bash", {"command": cmd})
+            payload = json.loads(blocks[0]["text"])
+            self.assertFalse(payload["ok"], cmd)
+            self.assertIn("blocked by the driver safety list", payload["error"], cmd)
+
+    def test_allowed_commands_pass_the_gate(self):
+        # only asserts the gate; execution happens and that is fine for these
+        for cmd in ("cat /tmp/x", "ls /tmp"):
+            self.assertFalse(self.m.bash_blocked(cmd), cmd)
+
+    def test_bash_blocked_unit(self):
+        self.assertTrue(self.m.bash_blocked("echo hi | bash"))
+        self.assertFalse(self.m.bash_blocked("nohup gedit &"))
+
+
+class RoundsCap(unittest.TestCase):
+    def setUp(self):
+        self.m = load_module()
+
+    def test_scales_with_action_budget(self):
+        self.assertEqual(self.m.rounds_cap(40), 170)
+        self.assertEqual(self.m.rounds_cap(10), 60)
+        self.assertGreater(self.m.rounds_cap(80), self.m.rounds_cap(40))
+
+
+class Telemetry(unittest.TestCase):
+    def setUp(self):
+        self.m = load_module()
+
+    def test_record_run_appends_json(self):
+        import tempfile, os
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "runs.jsonl")
+            self.m.record_run(path, {"status": "reported", "actions": 3})
+            self.m.record_run(path, {"status": "exhausted-no-report", "actions": 9})
+            lines = [json.loads(l) for l in open(path)]
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(lines[1]["actions"], 9)
+
+    def test_record_run_never_raises(self):
+        self.m.record_run("/proc/definitely/not/writable/runs.jsonl", {"x": 1})
+
+
+class SystemPromptGates(unittest.TestCase):
+    def setUp(self):
+        self.m = load_module()
+
+    def test_protocol_gates_present(self):
+        for needle in ("CAPTCHA", "AUTHORIZED:", "FINDINGS:", "CONTINUE from it",
+                       "VISION-BROKEN"):
+            self.assertIn(needle, self.m.SYSTEM, needle)

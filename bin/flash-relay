@@ -21,6 +21,7 @@ import base64
 import http.client
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -82,7 +83,12 @@ Your FIRST tool call must be a full screenshot. If you cannot actually see and d
 
 # Forms and irreplaceable state
 - NEVER navigate, reload, refresh, or close a browser tab that contains a filled but unsubmitted form. Open your target site in a NEW tab and leave every other tab exactly as found.
+- If the target form is already partially filled (a previous run may have got that far), CONTINUE from it. Never navigate or reload to "start fresh"; that destroys work.
 - Verify typed values cheaply (field echo, tab order, one screenshot per form section). Per-field screenshot verification is not your job.
+
+# Early aborts - report needs-escalation IMMEDIATELY, before acting
+- If the FIRST screenshot shows a CAPTCHA, a no-AI attestation, or a login wall the brief did not declare, do not fill anything. Filling a form that cannot be submitted wastes the whole budget.
+- If the brief carries no AUTHORIZED: line, the standing prohibitions below apply in full. An AUTHORIZED: line permits exactly what it names (for example "click the Submit button on this application") and nothing beyond it.
 
 # Hard prohibitions - report STATUS: needs-escalation instead of doing
 - Typing passwords, tokens, 2FA codes.
@@ -100,6 +106,7 @@ EVIDENCE:
   - <paths of key screenshots: initial, final>
 ANOMALIES: <unexpected things seen or done; "none" if none>
 RESULT: <one paragraph: end state and whether the brief's acceptance criteria are met>
+FINDINGS: <optional; MANDATORY for read/verify briefs: one line per question the brief asked, each with its verdict and the evidence behind it>
 
 Be honest: the driver verifies every done claim independently."""
 
@@ -229,33 +236,80 @@ def do_screenshot(a: dict) -> list:
             {"type": "text", "text": path + " " + json.dumps(meta)}]
 
 
+# Minimal blocklist for the bash tool. The prompt held for weeks of runs,
+# but this is the one tool where a hallucination reaches the system.
+BASH_BLOCKLIST = (
+    re.compile(r"\bsudo\b"), re.compile(r"\brm\b"), re.compile(r"\bdd\b"),
+    re.compile(r"\bmkfs"), re.compile(r"\bcurl\b"), re.compile(r"\bwget\b"),
+    re.compile(r"\bshutdown\b"), re.compile(r"\breboot\b"), re.compile(r"\bsystemctl\b"),
+    re.compile(r"\|\s*(ba)?sh\b"), re.compile(r"/dev/sd"), re.compile(r"chmod\s+777"),
+)
+
+
+def bash_blocked(command: str) -> bool:
+    return any(pat.search(command) for pat in BASH_BLOCKLIST)
+
+
+def rounds_cap(max_actions: int) -> int:
+    """The loop hard cap. Screenshots are free but each burns a round, and
+    the protocol demands one per action, so a fixed 60 rounds silently
+    became a ~20-action ceiling that killed runs before the budget and
+    before any report. Tie it to the action budget instead."""
+    return max(60, max_actions * 4 + 10)
+
+
+RUNS_LOG = os.path.expanduser("~/.cache/flash-relay/runs.jsonl")
+
+
+def record_run(runs_path: str, entry: dict) -> None:
+    try:
+        os.makedirs(os.path.dirname(runs_path), exist_ok=True)
+        with open(runs_path, "a") as fh:
+            fh.write(json.dumps(entry) + "\n")
+    except OSError:
+        pass  # telemetry must never kill a run
+
+
 def run_tool(name: str, a: dict) -> tuple[list, bool]:
-    """Execute a tool; returns (content blocks, counts_as_action)."""
-    if name == "screenshot":
-        return do_screenshot(a), False
-    if name == "click":
-        res = lcu("click", str(a["x"]), str(a["y"]), "--button", a.get("button", "left"),
-                  "--count", str(a.get("count", 1)))
-    elif name == "type_text":
-        res = lcu("type", a["text"])
-    elif name == "press_key":
-        res = lcu("key", *[str(k) for k in a["keys"]])
-    elif name == "scroll":
-        args = ["scroll", a["direction"], str(a.get("amount", 3))]
-        if a.get("x") is not None and a.get("y") is not None:
-            args += ["--x", str(a["x"]), "--y", str(a["y"])]
-        res = lcu(*args)
-    elif name == "drag":
-        res = lcu("drag", str(a["x1"]), str(a["y1"]), str(a["x2"]), str(a["y2"]))
-    elif name == "list_windows":
-        res = lcu("windows")
-    elif name == "focus_window":
-        res = lcu("focus", str(a["window"]))
-    elif name == "bash":
-        proc = subprocess.run(a["command"], shell=True, capture_output=True, text=True, timeout=60)
-        res = {"ok": proc.returncode == 0, "stdout": proc.stdout[-1500:], "stderr": proc.stderr[-500:]}
-    else:
-        res = {"ok": False, "error": f"unknown tool {name}"}
+    """Execute a tool; returns (content blocks, counts_as_action).
+
+    A malformed call (missing required key) is reported back to the model as
+    a tool error so it can retry correctly; it never crashes the run.
+    """
+    try:
+        if name == "screenshot":
+            return do_screenshot(a), False
+        if name == "bash" and bash_blocked(a["command"]):
+            res = {"ok": False, "error": "command blocked by the driver safety list; the bash tool is for app launch, cat/ls, and brief-allowed non-GUI steps only"}
+        elif name == "click":
+            res = lcu("click", str(a["x"]), str(a["y"]), "--button", a.get("button", "left"),
+                      "--count", str(a.get("count", 1)))
+        elif name == "type_text":
+            res = lcu("type", a["text"])
+        elif name == "press_key":
+            res = lcu("key", *[str(k) for k in a["keys"]])
+        elif name == "scroll":
+            direction = a.get("direction")
+            if direction not in ("up", "down", "left", "right"):
+                res = {"ok": False, "error": "scroll requires direction: up|down|left|right"}
+            else:
+                args = ["scroll", direction, str(a.get("amount", 3))]
+                if a.get("x") is not None and a.get("y") is not None:
+                    args += ["--x", str(a["x"]), "--y", str(a["y"])]
+                res = lcu(*args)
+        elif name == "drag":
+            res = lcu("drag", str(a["x1"]), str(a["y1"]), str(a["x2"]), str(a["y2"]))
+        elif name == "list_windows":
+            res = lcu("windows")
+        elif name == "focus_window":
+            res = lcu("focus", str(a["window"]))
+        elif name == "bash":
+            proc = subprocess.run(a["command"], shell=True, capture_output=True, text=True, timeout=60)
+            res = {"ok": proc.returncode == 0, "stdout": proc.stdout[-1500:], "stderr": proc.stderr[-500:]}
+        else:
+            res = {"ok": False, "error": f"unknown tool {name}"}
+    except KeyError as e:
+        res = {"ok": False, "error": f"malformed tool call: missing required parameter {e}; retry with all required parameters"}
     return [{"type": "text", "text": json.dumps(res)[:1500]}], name != "list_windows"
 
 
@@ -266,6 +320,7 @@ def main() -> int:
         return 2
     max_actions, timeout_s = 40, 480
     thinking = False
+    tag = ""
     argv = sys.argv[2:]
     if "--max-actions" in argv:
         max_actions = int(argv[argv.index("--max-actions") + 1])
@@ -273,6 +328,8 @@ def main() -> int:
         timeout_s = int(argv[argv.index("--timeout-s") + 1])
     if "--thinking" in argv:
         thinking = True
+    if "--tag" in argv and argv.index("--tag") + 1 < len(argv):
+        tag = argv[argv.index("--tag") + 1]
 
     brief = open(brief_path).read().strip()
     key = api_key()
@@ -281,12 +338,17 @@ def main() -> int:
     messages = [{"role": "user", "content": brief}]
     actions, t0, rounds = 0, time.time(), 0
 
-    while rounds < 60 and time.time() - t0 < timeout_s:
+    cap = rounds_cap(max_actions)
+    final_status = "blocked"
+    while rounds < cap and time.time() - t0 < timeout_s:
         prune_old_images(messages)
         resp = call_model(key, messages, thinking, conn)
         rounds += 1
         if resp.get("error") or resp.get("type") == "error":
             print(f"DRIVER: API error: {json.dumps(resp)[:400]}")
+            record_run(RUNS_LOG, {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "brief": os.path.abspath(brief_path),
+                                  "tag": tag, "actions": actions, "rounds": rounds,
+                                  "duration_s": round(time.time() - t0, 1), "status": "failed-api"})
             print("STATUS: failed\nSTEPS: %d\nEVIDENCE: n/a\nANOMALIES: API error after %d actions\nRESULT: run aborted on API failure" % (actions, actions))
             return 1
         content = resp.get("content", [])
@@ -294,7 +356,11 @@ def main() -> int:
         tool_uses = [b for b in content if b.get("type") == "tool_use"]
         texts = [b.get("text", "") for b in content if b.get("type") == "text"]
         if not tool_uses:
+            final_status = "reported"
             print("\n".join(t for t in texts if t))
+            record_run(RUNS_LOG, {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "brief": os.path.abspath(brief_path),
+                                  "tag": tag, "actions": actions, "rounds": rounds,
+                                  "duration_s": round(time.time() - t0, 1), "status": "reported"})
             return 0
         results = []
         for tu in tool_uses:
@@ -309,8 +375,15 @@ def main() -> int:
         if time.time() - t0 > timeout_s - 30:
             messages.append({"role": "user", "content":
                 "DRIVER: wall-clock budget nearly exhausted. Output your final report now."})
-    print("DRIVER: budget/rounds exhausted without a final report.")
-    print("STATUS: blocked\nSTEPS: %d\nEVIDENCE: n/a\nANOMALIES: driver budget exhausted\nRESULT: no final report produced" % actions)
+        if cap - rounds <= 2:
+            messages.append({"role": "user", "content":
+                "DRIVER: conversation round budget nearly exhausted. Output your final report now."})
+    if final_status != "reported":
+        print("DRIVER: budget/rounds exhausted without a final report.")
+        print("STATUS: blocked\nSTEPS: %d\nEVIDENCE: n/a\nANOMALIES: driver budget exhausted\nRESULT: no final report produced" % actions)
+        record_run(RUNS_LOG, {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "brief": os.path.abspath(brief_path),
+                              "tag": tag, "actions": actions, "rounds": rounds,
+                              "duration_s": round(time.time() - t0, 1), "status": "exhausted-no-report"})
     return 1
 
 

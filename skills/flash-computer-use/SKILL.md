@@ -109,6 +109,11 @@ exactly this: it stopped and is waiting on a human decision relayed by you.
   EXACT_TEXT: <literal strings to type, if any>
   ACCEPTANCE: <checkable end-state>
   FORBIDDEN: <task-specific additions to the standing prohibition list>
+  AUTHORIZED: <what the user explicitly permitted beyond read-only, e.g.
+  "click Submit on this application"; ABSENT means the escalation list
+  stands in full and submitting stays forbidden>
+  RESUME: <optional; "the form may be partially filled; screenshot before
+  any navigation and continue from what is there">
   ACTION_BUDGET: <N, default 40>
   ```
 
@@ -149,6 +154,29 @@ Only then report success to the user, citing the oracle you used.
 Second failure on the same subtask = stop and escalate to the user with
 before/after screenshots. No third try: twice-failed pixels mean the brief is
 wrong, not unlucky.
+
+Budget by task class (the brief overrides; this is the rule of thumb for
+choosing):
+
+| Task class | Actions | Wall clock | Why |
+|---|---|---|---|
+| Read/verify (idempotent, no input) | 60-80 | 15 min | long searches, many screenshots, zero blast radius |
+| Form driving | 40 | 8 min | tighter cap limits damage if the form misbehaves |
+| Mixed/unknown | 40 | 8 min | the code default |
+
+## Form brief checklist (traps that cost real runs)
+
+- Custom dropdowns can silently select the NEIGHBOURING option. Screenshot
+  after every dropdown, before moving on.
+- iCIMS-style select controls often need click, Arrow-Down, Return rather
+  than a plain click on the option.
+- File pickers (GTK) can leave a stale autocomplete tail in the name field:
+  shift+End then Delete before typing the path.
+- Resume parsers INVENT employers and titles from formatting. Re-verify
+  every field on the review page against the resume, not against what was
+  typed.
+- Long-idle forms expire mid-flight. If a submit returns to a blank or
+  login page, report blocked with the evidence instead of refilling.
 
 ## Worker report interpretation
 
