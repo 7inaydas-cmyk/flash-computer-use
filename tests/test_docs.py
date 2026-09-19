@@ -44,7 +44,8 @@ class SecretScan(unittest.TestCase):
     def test_no_key_material_in_tree(self):
         offenders = []
         paths = (list(repo_files(".py")) + list(repo_files(".sh"))
-                 + list(repo_files(".md")) + list(repo_files(".json")))
+                 + list(repo_files(".md")) + list(repo_files(".json"))
+                 + [os.path.join(REPO, "bin", n) for n in ("lcu", "flash-relay")])
         for path in paths:
             text = open(path, encoding="utf-8", errors="replace").read()
             for pat in self.PATTERNS:

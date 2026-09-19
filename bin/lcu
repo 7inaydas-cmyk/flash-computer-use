@@ -44,6 +44,12 @@ def need(binary: str):
         die(f"required tool not installed: {binary}")
 
 
+def region_in_bounds(region: tuple[int, int, int, int], w: int, h: int) -> bool:
+    """True if (x, y, width, height) lies fully inside the w x h screen."""
+    rx, ry, rw, rh = region
+    return rw > 0 and rh > 0 and rx >= 0 and ry >= 0 and rx + rw <= w and ry + rh <= h
+
+
 def screen_size() -> tuple[int, int]:
     out = run(["xdpyinfo"])
     m = re.search(r"dimensions:\s+(\d+)x(\d+)", out)
@@ -67,7 +73,7 @@ def cmd_screenshot(args):
         die("--window and --region are mutually exclusive")
     if args.region:
         rx, ry, rw, rh = args.region
-        if rw <= 0 or rh <= 0 or rx < 0 or ry < 0 or rx + rw > w or ry + rh > h:
+        if not region_in_bounds(args.region, w, h):
             die(f"region {list(args.region)} out of bounds for {w}x{h}")
         geom = f"{rw}x{rh}"
         grab = f"{DISPLAY}+{rx},{ry}"

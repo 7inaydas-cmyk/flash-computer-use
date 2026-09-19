@@ -128,7 +128,10 @@ def api_key() -> str:
              "or ~/.zcode/v2/config.json (see README, Install)")
 
 
-def call_model(key: str, messages: list, thinking: bool, conn) -> dict:
+RETRY_LADDER = (5, 15, 30, 45)
+
+
+def call_model(key: str, messages: list, thinking: bool, conn, deadline: float) -> dict:
     body = {
         "model": MODEL,
         "max_tokens": 4096,
@@ -149,13 +152,13 @@ def call_model(key: str, messages: list, thinking: bool, conn) -> dict:
         "content-length": str(len(payload)),
     }
     # Retry with backoff on transient faults: transport errors, 429, and
-    # 5xx. Coding-plan rate limits are per-minute windows: short 2/4/8s
-    # ladders cannot clear them (a live 429 outlived the old ladder), so
-    # honor Retry-After when present and use a 5/15/30/45s ladder capped
-    # by the caller's remaining wall clock.
+    # 5xx. Coding-plan rate limits are per-minute windows: short ladders
+    # cannot clear them (a live 429 outlived a 2/4/8s ladder once). Honor
+    # Retry-After when present, else walk RETRY_LADDER. Never sleep past
+    # the caller's deadline (the run's wall clock), passed in by main().
     last_error = "no attempts made"
-    deadline = time.time() + 120
-    for attempt in range(5):
+    backoff_s = RETRY_LADDER[0]
+    for attempt in range(len(RETRY_LADDER) + 1):
         if attempt:
             time.sleep(backoff_s)
         try:
@@ -166,20 +169,25 @@ def call_model(key: str, messages: list, thinking: bool, conn) -> dict:
                 return json.loads(data)
             last_error = f"HTTP {resp.status}: {data[:300].decode(errors='replace')}"
             if resp.status != 429 and resp.status < 500:
-                return {"error": last_error, "rate_limited": resp.status == 429}
-            retry_after = float(resp.getheader("Retry-After") or 0) if hasattr(resp, "getheader") else 0
-            backoff_s = min(max(retry_after or 5 * (2 ** (attempt - 1)), 5), 45) if attempt else 5
+                return {"error": last_error, "rate_limited": False}
+            retry_after = 0.0
+            if hasattr(resp, "getheader"):
+                try:
+                    retry_after = float(resp.getheader("Retry-After") or 0)
+                except (TypeError, ValueError):
+                    retry_after = 0.0
+            backoff_s = min(retry_after, 60) if retry_after else RETRY_LADDER[min(attempt, len(RETRY_LADDER) - 1)]
             if time.time() + backoff_s > deadline:
-                return {"error": last_error, "rate_limited": resp.status == 429}
+                return {"error": last_error, "rate_limited": True}
         except Exception as e:  # noqa: BLE001 - reconnect and retry transports
             last_error = f"transport: {e}"
-            backoff_s = min(5 * (2 ** attempt), 45)
+            backoff_s = RETRY_LADDER[min(attempt, len(RETRY_LADDER) - 1)]
             try:
                 conn.close()
                 conn.connect()
             except Exception:  # noqa: BLE001 - next attempt will report it
                 pass
-    return {"error": last_error, "rate_limited": "HTTP 429" in last_error}
+    return {"error": last_error, "rate_limited": "429" in last_error}
 
 
 KEEP_LAST_IMAGES = 2
@@ -323,23 +331,30 @@ def run_tool(name: str, a: dict) -> tuple[list, bool]:
     return [{"type": "text", "text": json.dumps(res)[:1500]}], name != "list_windows"
 
 
+def parse_argv(argv: list) -> dict:
+    defaults = {"max_actions": 40, "timeout_s": 480, "thinking": False, "tag": ""}
+
+    def flag_value(flag):
+        return argv[argv.index(flag) + 1] if flag in argv and argv.index(flag) + 1 < len(argv) else None
+
+    for key, flag, cast in (("max_actions", "--max-actions", int),
+                            ("timeout_s", "--timeout-s", int),
+                            ("tag", "--tag", str)):
+        value = flag_value(flag)
+        if value is not None:
+            defaults[key] = cast(value)
+    defaults["thinking"] = "--thinking" in argv
+    return defaults
+
+
 def main() -> int:
     brief_path = sys.argv[1] if len(sys.argv) > 1 else None
     if not brief_path or not os.path.exists(brief_path):
         print("usage: flash-relay.py <brief-file> [--max-actions N] [--timeout-s S] [--thinking]", file=sys.stderr)
         return 2
-    max_actions, timeout_s = 40, 480
-    thinking = False
-    tag = ""
-    argv = sys.argv[2:]
-    if "--max-actions" in argv:
-        max_actions = int(argv[argv.index("--max-actions") + 1])
-    if "--timeout-s" in argv:
-        timeout_s = int(argv[argv.index("--timeout-s") + 1])
-    if "--thinking" in argv:
-        thinking = True
-    if "--tag" in argv and argv.index("--tag") + 1 < len(argv):
-        tag = argv[argv.index("--tag") + 1]
+    options = parse_argv(sys.argv[2:])
+    max_actions, timeout_s = options["max_actions"], options["timeout_s"]
+    thinking, tag = options["thinking"], options["tag"]
 
     brief = open(brief_path).read().strip()
     key = api_key()
@@ -350,19 +365,23 @@ def main() -> int:
 
     cap = rounds_cap(max_actions)
     final_status = "blocked"
+
+    def log_run(status, extra=None):
+        record_run(RUNS_LOG, {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                              "brief": os.path.abspath(brief_path), "tag": tag,
+                              "actions": actions, "rounds": rounds,
+                              "duration_s": round(time.time() - t0, 1),
+                              "status": status, **(extra or {})})
     while rounds < cap and time.time() - t0 < timeout_s:
         prune_old_images(messages)
-        resp = call_model(key, messages, thinking, conn)
+        resp = call_model(key, messages, thinking, conn, deadline=t0 + timeout_s)
         rounds += 1
         if resp.get("error") or resp.get("type") == "error":
             kind = "rate-limited" if resp.get("rate_limited") else "api-error"
             print(f"DRIVER: API error ({kind}): {json.dumps(resp)[:400]}")
             if kind == "rate-limited":
                 print("DRIVER: the plan's request quota window is exhausted; wait ~60s before the next run.")
-            record_run(RUNS_LOG, {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "brief": os.path.abspath(brief_path),
-                                  "tag": tag, "actions": actions, "rounds": rounds,
-                                  "duration_s": round(time.time() - t0, 1), "status": "failed-" + kind,
-                                  "error": str(resp.get("error"))[:160]})
+            log_run("failed-" + kind, extra={"error": str(resp.get("error"))[:160]})
             print("STATUS: failed\nSTEPS: %d\nEVIDENCE: n/a\nANOMALIES: %s after %d actions\nRESULT: run aborted on API failure" % (actions, kind, actions))
             return 1
         content = resp.get("content", [])
@@ -372,9 +391,7 @@ def main() -> int:
         if not tool_uses:
             final_status = "reported"
             print("\n".join(t for t in texts if t))
-            record_run(RUNS_LOG, {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "brief": os.path.abspath(brief_path),
-                                  "tag": tag, "actions": actions, "rounds": rounds,
-                                  "duration_s": round(time.time() - t0, 1), "status": "reported"})
+            log_run("reported")
             return 0
         results = []
         for tu in tool_uses:
@@ -395,9 +412,7 @@ def main() -> int:
     if final_status != "reported":
         print("DRIVER: budget/rounds exhausted without a final report.")
         print("STATUS: blocked\nSTEPS: %d\nEVIDENCE: n/a\nANOMALIES: driver budget exhausted\nRESULT: no final report produced" % actions)
-        record_run(RUNS_LOG, {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "brief": os.path.abspath(brief_path),
-                              "tag": tag, "actions": actions, "rounds": rounds,
-                              "duration_s": round(time.time() - t0, 1), "status": "exhausted-no-report"})
+        log_run("exhausted-no-report")
     return 1
 
 

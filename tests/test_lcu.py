@@ -1,4 +1,7 @@
+import importlib.machinery
+import importlib.util
 import json
+import sys
 import os
 import shutil
 import subprocess
@@ -66,6 +69,35 @@ class LcuIntegration(unittest.TestCase):
         for w in d["windows"]:
             for field in ("id", "name", "x", "y", "width", "height", "active"):
                 self.assertIn(field, w)
+
+
+def load_lcu():
+    spec = importlib.util.spec_from_loader(
+        "lcu", importlib.machinery.SourceFileLoader("lcu", LCU))
+    m = importlib.util.module_from_spec(spec)
+    old_argv = sys.argv
+    sys.argv = ["lcu"]
+    try:
+        spec.loader.exec_module(m)
+    except SystemExit:
+        pass
+    finally:
+        sys.argv = old_argv
+    return m
+
+
+class LcuRegionBoundsUnit(unittest.TestCase):
+    """Pure logic, no display needed."""
+
+    def test_bounds(self):
+        m = load_lcu()
+        self.assertTrue(m.region_in_bounds((0, 0, 10, 10), 100, 100))
+        self.assertTrue(m.region_in_bounds((90, 90, 10, 10), 100, 100))
+        self.assertFalse(m.region_in_bounds((91, 0, 10, 10), 100, 100))
+        self.assertFalse(m.region_in_bounds((0, 91, 10, 10), 100, 100))
+        self.assertFalse(m.region_in_bounds((0, 0, 0, 10), 100, 100))
+        self.assertFalse(m.region_in_bounds((0, 0, 10, 0), 100, 100))
+        self.assertFalse(m.region_in_bounds((-1, 0, 10, 10), 100, 100))
 
 
 class LcuUnit(unittest.TestCase):
