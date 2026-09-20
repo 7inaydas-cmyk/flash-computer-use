@@ -51,8 +51,9 @@ CHILD_ENV = dict(os.environ)
 CHILD_ENV.setdefault("DISPLAY", ":0")
 # learned from the first screenshot result; coordinate validation is
 # impossible before it exists, and the vision gate guarantees no action
-# runs before that first screenshot anyway
-SCREEN = {"w": None, "h": None}
+# runs before that first screenshot anyway. Written by do_screenshot,
+# read by coord_error: the only cross-function coupling in the executor.
+SCREEN = {"width": None, "height": None}
 
 TOOLS = [
     {"name": "screenshot",
@@ -83,7 +84,7 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {}}},
     {"name": "focus_window", "description": "Activate/raise a window by 'active', id, or name substring. Ambiguous names are an error; use an id from list_windows. Do this before typing.",
      "input_schema": {"type": "object", "required": ["window"], "properties": {"window": {"type": "string"}}}},
-    {"name": "bash", "description": "Run ONE allowlisted command, no shell features. Allowed: read/oracle binaries (cat, ls, head, tail, wc, file, stat, grep, pgrep, ps, echo, pwd, which, date, du, df) and GUI app launches (e.g. gnome-text-editor FILE, firefox URL). Pipes, ;, &&, ||, redirection, $, backticks and multiple commands are refused. Input automation must use press_key/type_text, not xdotool.",
+    {"name": "bash", "description": "Run ONE allowlisted command, no shell features. Allowed: read/oracle binaries (cat, ls, head, tail, wc, file, stat, grep, pgrep, ps, echo, pwd, which, date, du, df) and GUI app launches (e.g. gnome-text-editor FILE, firefox URL; a nohup prefix is allowed). Pipes, ;, &&, ||, redirection, $, backticks and multiple commands are refused. Input automation must use press_key/type_text, not xdotool.",
      "input_schema": {"type": "object", "required": ["command"], "properties": {"command": {"type": "string"}}}},
 ]
 
@@ -143,18 +144,18 @@ FINDINGS: <optional; MANDATORY for read/verify briefs: one line per question the
 
 Be honest: a verified "blocked" beats an optimistic "done"; the orchestrator verifies every done claim independently."""
 
-SYSTEM = SYSTEM_TEMPLATE.format(max_actions=DEFAULT_MAX_ACTIONS)
-
-REPORT_REQUIRED_MARKERS = ("STATUS:", "RESULT:")
+REPORT_REQUIRED_MARKERS = ("STATUS:", "STEPS:", "EVIDENCE:", "PRODUCED:", "ANOMALIES:", "RESULT:")
 
 
 def build_system(max_actions: int) -> str:
     return SYSTEM_TEMPLATE.format(max_actions=max_actions)
 
 
-def api_key() -> str:
+def api_key():
     # Primary: the CLI config provider record. Fallback: the ZCode desktop
     # app's provider store, which is where a fresh install keeps its key.
+    # Returns None on failure: the caller reports and writes telemetry,
+    # because every exit path must leave a trace.
     for path, pick in (
         ("~/.zcode/cli/config.json", lambda c: c["provider"]["zai-coding-plan"]["options"]["apiKey"]),
         ("~/.zcode/v2/config.json", lambda c: c["provider"]["builtin:zai-coding-plan"]["options"]["apiKey"]),
@@ -163,14 +164,13 @@ def api_key() -> str:
             return pick(json.load(open(os.path.expanduser(path))))
         except (OSError, KeyError, json.JSONDecodeError):
             continue
-    sys.exit("flash-relay: no Z.ai provider key found in ~/.zcode/cli/config.json "
-             "or ~/.zcode/v2/config.json (see README, Install)")
+    return None
 
 
 RETRY_LADDER = (5, 15, 30, 45)
 
 
-def call_model(key: str, messages: list, thinking: bool, conn, deadline: float, system: str = SYSTEM) -> dict:
+def call_model(key: str, messages: list, thinking: bool, conn, deadline: float, system: str) -> dict:
     body = {
         "model": MODEL,
         "max_tokens": 4096,
@@ -276,20 +276,20 @@ def lcu(*args: str) -> dict:
     return {"ok": False, "error": (proc.stderr or proc.stdout or "no output")[:300]}
 
 
-def do_screenshot(a: dict) -> list:
+def do_screenshot(tool_input: dict) -> list:
     args = ["screenshot"]
-    if a.get("window"):
-        args += ["--window", str(a["window"])]
-    if a.get("region"):
-        args += ["--region", *[str(v) for v in a["region"]]]
-    if a.get("scale") and a["scale"] != 1.0:
-        args += ["--scale", str(a["scale"])]
+    if tool_input.get("window"):
+        args += ["--window", str(tool_input["window"])]
+    if tool_input.get("region"):
+        args += ["--region", *[str(v) for v in tool_input["region"]]]
+    if tool_input.get("scale") and tool_input["scale"] != 1.0:
+        args += ["--scale", str(tool_input["scale"])]
     res = lcu(*args)
     if not res.get("ok"):
         return [{"type": "text", "text": f"screenshot failed: {res.get('error')}"}]
     scr = res.get("screen") if isinstance(res.get("screen"), dict) else {}
     if isinstance(scr.get("width"), int) and isinstance(scr.get("height"), int):
-        SCREEN["w"], SCREEN["h"] = scr["width"], scr["height"]
+        SCREEN["width"], SCREEN["height"] = scr["width"], scr["height"]
     path = res.get("path")
     if not path:
         return [{"type": "text", "text": "screenshot failed: lcu returned no path"}]
@@ -326,15 +326,15 @@ def coord_error(x, y):
     """Executor-side guard, the pixel analogue of jev-ultrafast's choice
     validation: model-emitted geometry is checked against the observed
     screen before it can become an input event."""
-    if SCREEN["w"] is None or SCREEN["h"] is None:
+    if SCREEN["width"] is None or SCREEN["height"] is None:
         return None
     try:
         xf, yf = float(x), float(y)
     except (TypeError, ValueError):
         return f"coordinates must be numbers, got ({x!r}, {y!r})"
-    if not (0 <= xf < SCREEN["w"] and 0 <= yf < SCREEN["h"]):
+    if not (0 <= xf < SCREEN["width"] and 0 <= yf < SCREEN["height"]):
         return (f"coordinates ({x}, {y}) are outside the "
-                f"{SCREEN['w']}x{SCREEN['h']} screen; recompute from the latest screenshot")
+                f"{SCREEN['width']}x{SCREEN['height']} screen; recompute from the latest screenshot")
     return None
 
 
@@ -427,32 +427,30 @@ class SafetyPolicy:
         self.fresh_frame = False
         self.refusals = 0
 
-    def admit(self, name, a, index_in_turn):
-        a = a if isinstance(a, dict) else {}
+    def admit(self, name, tool_input, index_in_turn):
+        tool_input = tool_input if isinstance(tool_input, dict) else {}
         if index_in_turn > 0:
             return False, ("driver rule: one tool call per turn; only the first call of a turn "
                            "executes and the rest are refused. Re-observe with a screenshot, "
                            "then issue your next call alone.")
+        if not self.first_frame_taken:
+            if name == "screenshot" and not (tool_input.get("window") or tool_input.get("region")):
+                return True, ""
+            return False, ("vision gate: the first tool call of the run must be one FULL screenshot "
+                           "(no window, no region); nothing else runs before it. Take it now, "
+                           "apply the vision-gate checks, then continue.")
         if is_action_tool(name):
             if self.actions >= self.max_actions:
                 return False, (f"action budget reached ({self.actions}/{self.max_actions}); "
                                "the driver will execute no further action. Output your final report now.")
-            if not self.first_frame_taken:
-                return False, ("vision gate: the first tool call of the run must be one FULL screenshot "
-                               "(no window, no region). Take it now, apply the vision-gate checks, "
-                               "then continue.")
             if not self.fresh_frame:
                 return False, ("fresh-frame rule: take a screenshot (and look at it) before this "
                                "action; acting on a stale frame is refused.")
-        elif name == "screenshot" and not self.first_frame_taken:
-            if a.get("window") or a.get("region"):
-                return False, ("vision gate: the FIRST screenshot of the run must be full-frame "
-                               "(no window, no region); later screenshots may crop.")
         return True, ""
 
-    def record(self, name, a, blocks):
+    def record(self, name, tool_input, blocks):
         has_frame = any(isinstance(b, dict) and b.get("type") == "image" for b in blocks)
-        if name == "screenshot" and has_frame and not (a.get("window") or a.get("region")):
+        if name == "screenshot" and has_frame and not (tool_input.get("window") or tool_input.get("region")):
             self.first_frame_taken = True
         if is_action_tool(name):
             self.actions += 1
@@ -507,17 +505,17 @@ def launch_app(argv: list) -> dict:
                                   "do not keep retrying the same launcher"}
 
 
-def run_tool(name: str, a: dict) -> tuple[list, bool]:
+def run_tool(name: str, tool_input: dict) -> tuple[list, bool]:
     """Execute one admitted tool call; returns (content blocks, counts_as_action).
 
-    A malformed or hostile call is reported back to the model as a tool
+    A malformed or hostile call is reported back to the model as tool_input tool
     error so it can retry correctly; nothing here may raise.
     """
     try:
         if name == "screenshot":
-            return do_screenshot(a), False
+            return do_screenshot(tool_input), False
         if name == "bash":
-            argv, launch, reason = bash_policy(a.get("command"))
+            argv, launch, reason = bash_policy(tool_input.get("command"))
             if argv is None:
                 res = {"ok": False, "error": f"command refused: {reason}"}
             elif launch:
@@ -531,20 +529,20 @@ def run_tool(name: str, a: dict) -> tuple[list, bool]:
                     res = {"ok": False, "error": f"bash command timed out after {BASH_TIMEOUT_S}s and was killed; "
                                                  "it may have partially taken effect; do not retry it blindly"}
         elif name == "click":
-            err = coord_error(a["x"], a["y"])
+            err = coord_error(tool_input["x"], tool_input["y"])
             if err:
                 res = {"ok": False, "error": err}
             else:
-                res = lcu("click", str(a["x"]), str(a["y"]), "--button", a.get("button", "left"),
-                          "--count", str(a.get("count", 1)))
+                res = lcu("click", str(tool_input["x"]), str(tool_input["y"]), "--button", tool_input.get("button", "left"),
+                          "--count", str(tool_input.get("count", 1)))
         elif name == "type_text":
-            text = a.get("text")
+            text = tool_input.get("text")
             if not isinstance(text, str):
-                res = {"ok": False, "error": "type_text requires text as a string"}
+                res = {"ok": False, "error": "type_text requires text as tool_input string"}
             else:
                 res = lcu("type", text)
         elif name == "press_key":
-            keys = a.get("keys")
+            keys = tool_input.get("keys")
             if (not isinstance(keys, list) or not keys
                     or not all(isinstance(k, str) and k.strip() for k in keys)):
                 res = {"ok": False, "error": "press_key requires keys as an ARRAY of combo strings, "
@@ -555,36 +553,36 @@ def run_tool(name: str, a: dict) -> tuple[list, bool]:
             else:
                 res = lcu("key", *keys)
         elif name == "scroll":
-            direction = a.get("direction")
+            direction = tool_input.get("direction")
             if direction not in ("up", "down", "left", "right"):
                 res = {"ok": False, "error": "scroll requires direction: up|down|left|right"}
             else:
                 try:
-                    amount = int(a.get("amount", 3))
+                    amount = int(tool_input.get("amount", 3))
                 except (TypeError, ValueError):
                     amount = 0
                 if not (1 <= amount <= SCROLL_MAX):
                     res = {"ok": False, "error": f"scroll amount must be an integer from 1 to {SCROLL_MAX}"}
                 else:
                     args = ["scroll", direction, str(amount)]
-                    if a.get("x") is not None and a.get("y") is not None:
-                        args += ["--x", str(a["x"]), "--y", str(a["y"])]
+                    if tool_input.get("x") is not None and tool_input.get("y") is not None:
+                        args += ["--x", str(tool_input["x"]), "--y", str(tool_input["y"])]
                     res = lcu(*args)
         elif name == "drag":
-            err = coord_error(a["x1"], a["y1"]) or coord_error(a["x2"], a["y2"])
+            err = coord_error(tool_input["x1"], tool_input["y1"]) or coord_error(tool_input["x2"], tool_input["y2"])
             if err:
                 res = {"ok": False, "error": err}
             else:
-                res = lcu("drag", str(a["x1"]), str(a["y1"]), str(a["x2"]), str(a["y2"]))
+                res = lcu("drag", str(tool_input["x1"]), str(tool_input["y1"]), str(tool_input["x2"]), str(tool_input["y2"]))
         elif name == "list_windows":
             res = lcu("windows")
         elif name == "focus_window":
-            res = lcu("focus", str(a["window"]))
+            res = lcu("focus", str(tool_input["window"]))
         else:
             res = {"ok": False, "error": f"unknown tool {name}"}
     except KeyError as e:
         res = {"ok": False, "error": f"malformed tool call: missing required parameter {e}; retry with all required parameters"}
-    except Exception as e:  # noqa: BLE001 - a tool error must never crash the run
+    except Exception as e:  # noqa: BLE001 - tool_input tool error must never crash the run
         res = {"ok": False, "error": f"tool error ({type(e).__name__}): {e}"}
     return [{"type": "text", "text": json.dumps(res)[:1500]}], is_action_tool(name)
 
@@ -602,7 +600,10 @@ def parse_argv(argv: list) -> dict:
                             ("tag", "--tag", str)):
         value = flag_value(flag)
         if value is not None:
-            out[key] = cast(value)
+            try:
+                out[key] = cast(value)
+            except ValueError:
+                print(f"flash-relay: ignoring {flag} {value!r}: not a valid value", file=sys.stderr)
     out["thinking"] = "--thinking" in argv
     return out
 
@@ -612,7 +613,7 @@ def resolve_budget(brief: str, parsed: dict) -> dict:
     brief's ACTION_BUDGET line, else the default. The SYSTEM prompt and
     the enforcement code therefore always agree on the number."""
     out = dict(parsed)
-    m = re.search(r"^ACTION_BUDGET:\s*(\d+)\s*$", brief, re.MULTILINE)
+    m = re.search(r"^ACTION_BUDGET:\s*(\d+)", brief, re.MULTILINE)
     brief_n = min(200, max(1, int(m.group(1)))) if m else None
     if out["max_actions"] is None:
         out["max_actions"] = brief_n if brief_n is not None else DEFAULT_MAX_ACTIONS
@@ -625,26 +626,44 @@ def looks_like_report(text: str) -> bool:
     return all(marker in text for marker in REPORT_REQUIRED_MARKERS)
 
 
+def result_is_error(blocks) -> bool:
+    """True when a tool's own result says it failed (ok: false), so the
+    loop can flag the tool_result with is_error for the model."""
+    try:
+        first = blocks[0]
+        return (isinstance(first, dict) and first.get("type") == "text"
+                and not json.loads(first["text"]).get("ok", True))
+    except (IndexError, KeyError, TypeError, ValueError):
+        return False
+
+
 def main() -> int:
     brief_path = sys.argv[1] if len(sys.argv) > 1 else None
     if not brief_path or not os.path.exists(brief_path):
         print("usage: flash-relay <brief-file> [--max-actions N] [--timeout-s S] [--thinking]", file=sys.stderr)
+        record_run(RUNS_LOG, {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                              "brief": os.path.abspath(brief_path) if brief_path else "",
+                              "tag": "", "status": "failed-usage"})
         return 2
-    with open(brief_path) as fh:
-        brief = fh.read().strip()
-    options = resolve_budget(brief, parse_argv(sys.argv[2:]))
+    options = parse_argv(sys.argv[2:])
+    tag = options["tag"]
+    try:
+        with open(brief_path) as fh:
+            brief = fh.read().strip()
+    except OSError as e:
+        print(f"flash-relay: cannot read brief: {e}", file=sys.stderr)
+        record_run(RUNS_LOG, {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                              "brief": os.path.abspath(brief_path), "tag": tag,
+                              "status": "failed-brief-read", "error": str(e)[:160]})
+        return 2
+    options = resolve_budget(brief, options)
     max_actions, timeout_s = options["max_actions"], options["timeout_s"]
-    thinking, tag = options["thinking"], options["tag"]
+    thinking = options["thinking"]
 
-    key = api_key()
-    system = build_system(max_actions)
-    conn = http.client.HTTPSConnection(urllib.parse.urlparse(API).netloc, timeout=180)
-    messages = [{"role": "user", "content": brief}]
     policy = SafetyPolicy(max_actions)
     t0, rounds = time.time(), 0
     malformed_turns = 0
     template_nudged = False
-
     cap = rounds_cap(max_actions)
 
     def log_run(status, extra=None):
@@ -654,6 +673,16 @@ def main() -> int:
                               "refusals": policy.refusals, "max_actions": max_actions,
                               "duration_s": round(time.time() - t0, 1),
                               "status": status, **(extra or {})})
+    key = api_key()
+    if not key:
+        print("flash-relay: no Z.ai provider key found in ~/.zcode/cli/config.json "
+              "or ~/.zcode/v2/config.json (see README, Install)", file=sys.stderr)
+        log_run("failed-no-key")
+        return 2
+    system = build_system(max_actions)
+    conn = http.client.HTTPSConnection(urllib.parse.urlparse(API).netloc, timeout=180)
+    messages = [{"role": "user", "content": brief}]
+
     try:
         budget_announced = False
         while rounds < cap and time.time() - t0 < timeout_s:
@@ -704,19 +733,23 @@ def main() -> int:
                 if not isinstance(tu, dict):
                     tu = {}
                 name = tu.get("name") or ""
-                a = tu.get("input") if isinstance(tu.get("input"), dict) else {}
+                tool_input = tu.get("input") if isinstance(tu.get("input"), dict) else {}
                 tid = tu.get("id") or f"malformed-{rounds}-{i}"
-                allowed, reason = policy.admit(name, a, i)
+                allowed, reason = policy.admit(name, tool_input, i)
                 if not allowed:
                     policy.refusals += 1
                     results.append({"type": "tool_result", "tool_use_id": tid, "is_error": True,
                                     "content": [{"type": "text", "text": "DRIVER refusal: " + reason}]})
                     continue
-                blocks, _ = run_tool(name, a)
+                blocks, _ = run_tool(name, tool_input)
+                errored = result_is_error(blocks)
                 if is_action_tool(name):
                     blocks = blocks + post_action_frame()
-                policy.record(name, a, blocks)
-                results.append({"type": "tool_result", "tool_use_id": tid, "content": blocks})
+                policy.record(name, tool_input, blocks)
+                tool_result = {"type": "tool_result", "tool_use_id": tid, "content": blocks}
+                if errored:
+                    tool_result["is_error"] = True
+                results.append(tool_result)
             messages.append({"role": "user", "content": results})
             if policy.actions >= max_actions and not budget_announced:
                 budget_announced = True
@@ -733,6 +766,11 @@ def main() -> int:
         print("STATUS: blocked\nSTEPS: %d\nEVIDENCE: n/a\nANOMALIES: driver budget exhausted\nRESULT: no final report produced" % policy.actions)
         log_run("exhausted-no-report")
         return 1
+    except KeyboardInterrupt:
+        print("DRIVER: interrupted")
+        print("STATUS: failed\nSTEPS: %d\nEVIDENCE: n/a\nANOMALIES: interrupted\nRESULT: run aborted by interrupt" % policy.actions)
+        log_run("interrupted")
+        return 130
     except Exception as e:  # noqa: BLE001 - a driver bug must still report and log
         print(f"DRIVER: internal error: {type(e).__name__}: {e}")
         print("STATUS: failed\nSTEPS: %d\nEVIDENCE: n/a\nANOMALIES: driver internal error\nRESULT: run aborted" % policy.actions)

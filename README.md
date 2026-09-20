@@ -100,8 +100,9 @@ CRITICAL: true only for irreversible or spend-bearing tasks
 ```
 
 The driver reads `ACTION_BUDGET` from the brief (the `--max-actions` flag
-overrides it) and stops executing actions the moment the cap is hit, so
-the number in the brief and the number enforced are always the same.
+overrides it, values clamp to 1..200) and stops executing actions the
+moment the cap is hit, so the number in the brief and the number enforced
+are always the same.
 
 Run it, hands off the mouse and keyboard until it finishes:
 
@@ -141,9 +142,9 @@ Structural, in the driver, always on:
   needs a fresh frame since the previous one; no acting blind or on
   stale frames. The driver itself attaches a fresh post-action screenshot
   to every action result, so the loop spends no model round on
-  re-observation, and model-emitted coordinates, key combos, and scroll
-  amounts are validated against the observed screen before they become
-  input events.
+  re-observation; model-emitted coordinates are validated against the
+  observed screen, and key combos and scroll amounts are format-checked,
+  before they become input events.
 - A hard action cap (brief `ACTION_BUDGET`, default 40): past it, nothing
   executes, no matter what the model emits.
 - The bash tool is an allowlist, not a denylist: one command line, one

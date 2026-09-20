@@ -77,14 +77,12 @@ class ApiKeyFallback(unittest.TestCase):
             finally:
                 os.environ["HOME"] = real_home
 
-    def test_missing_everything_exits_with_message(self):
+    def test_missing_everything_returns_none(self):
         real_home = os.environ["HOME"]
         with tempfile.TemporaryDirectory() as home:
             os.environ["HOME"] = home
             try:
-                with self.assertRaises(SystemExit) as ctx:
-                    M.api_key()
-                self.assertIn("no Z.ai provider key", str(ctx.exception))
+                self.assertIsNone(M.api_key())
             finally:
                 os.environ["HOME"] = real_home
 
@@ -276,9 +274,17 @@ class SafetyPolicyTests(unittest.TestCase):
         p = M.SafetyPolicy(5)
         ok, reason = p.admit("screenshot", {"region": [0, 0, 10, 10]}, 0)
         self.assertFalse(ok)
-        self.assertIn("full-frame", reason)
+        self.assertIn("FULL screenshot", reason)
         ok, reason = p.admit("screenshot", {"window": "active"}, 0)
         self.assertFalse(ok)
+
+    def test_nothing_runs_before_the_first_full_screenshot(self):
+        p = M.SafetyPolicy(5)
+        ok, reason = p.admit("list_windows", {}, 0)
+        self.assertFalse(ok)
+        self.assertIn("vision gate", reason)
+        p.record("screenshot", {}, self.shot())
+        self.assertTrue(p.admit("list_windows", {}, 0)[0])
 
     def test_one_tool_call_per_turn(self):
         p = M.SafetyPolicy(5)
@@ -359,13 +365,13 @@ class SystemPromptGates(unittest.TestCase):
     def test_protocol_gates_present(self):
         for needle in ("CAPTCHA", "AUTHORIZED:", "FINDINGS:", "CONTINUE from it",
                        "VISION-BROKEN"):
-            self.assertIn(needle, M.SYSTEM, needle)
+            self.assertIn(needle, M.SYSTEM_TEMPLATE, needle)
 
     def test_new_protocol_rules_present(self):
         for needle in ("PRODUCED:", "closed whitelist", "ONE tool call per model turn",
                        "Ambiguity is a stop", "cloud services", "CRITICAL: true",
                        "post-action screenshot attached", "rides along with every action result"):
-            self.assertIn(needle, M.SYSTEM, needle)
+            self.assertIn(needle, M.SYSTEM_TEMPLATE, needle)
 
     def test_build_system_carries_the_real_cap(self):
         self.assertIn("Past the action cap (7 actions)", M.build_system(7))
@@ -385,6 +391,12 @@ class BudgetResolution(unittest.TestCase):
         out = M.parse_argv(["--tag"])
         self.assertEqual(out["tag"], "")
 
+    def test_invalid_numeric_flag_is_ignored_not_crashed(self):
+        out = M.parse_argv(["--max-actions", "abc", "--timeout-s", "xyz", "--tag", "t"])
+        self.assertIsNone(out["max_actions"])
+        self.assertIsNone(out["timeout_s"])
+        self.assertEqual(out["tag"], "t")
+
     def test_brief_budget_is_honoured(self):
         out = M.resolve_budget("SUBTASK: x\nACTION_BUDGET: 80\n", M.parse_argv([]))
         self.assertEqual(out["max_actions"], 80)
@@ -399,6 +411,10 @@ class BudgetResolution(unittest.TestCase):
         out = M.resolve_budget("SUBTASK: x\n", M.parse_argv([]))
         self.assertEqual(out["max_actions"], M.DEFAULT_MAX_ACTIONS)
 
+    def test_brief_budget_with_trailing_words_parses(self):
+        out = M.resolve_budget("ACTION_BUDGET: 40 actions (tight)", M.parse_argv([]))
+        self.assertEqual(out["max_actions"], 40)
+
     def test_brief_budget_is_clamped(self):
         out = M.resolve_budget("ACTION_BUDGET: 99999\n", M.parse_argv([]))
         self.assertEqual(out["max_actions"], 200)
@@ -406,9 +422,21 @@ class BudgetResolution(unittest.TestCase):
 
 class ReportShape(unittest.TestCase):
 
-    def test_looks_like_report(self):
-        self.assertTrue(M.looks_like_report("STATUS: done\nRESULT: ok"))
+    def test_looks_like_report_requires_every_marker(self):
+        full = ("STATUS: done\nSTEPS: 1\nEVIDENCE:\n  - x\nPRODUCED:\n  - none\n"
+                "ANOMALIES: none\nRESULT: ok")
+        self.assertTrue(M.looks_like_report(full))
+        for missing in ("STATUS:", "STEPS:", "EVIDENCE:", "PRODUCED:", "ANOMALIES:", "RESULT:"):
+            broken = full.replace(missing, "X" + missing[1:])
+            self.assertFalse(M.looks_like_report(broken), missing)
         self.assertFalse(M.looks_like_report("all done, trust me"))
+
+    def test_result_is_error_flags_only_json_failures(self):
+        self.assertTrue(M.result_is_error([{"type": "text", "text": '{"ok": false}'}]))
+        self.assertFalse(M.result_is_error([{"type": "text", "text": '{"ok": true}'}]))
+        self.assertFalse(M.result_is_error([{"type": "text", "text": "screenshot failed: x"}]))
+        self.assertFalse(M.result_is_error([{"type": "image", "source": {}}]))
+        self.assertFalse(M.result_is_error([]))
 
 
 # --- loop integration: the whole driver against scripted model turns ------
@@ -481,6 +509,22 @@ class LoopHarness(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             rc = M.main()
         return rc, out.getvalue()
+
+    def test_usage_exit_writes_telemetry(self):
+        sys.argv = ["flash-relay", "/nonexistent-brief.txt"]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = M.main()
+        self.assertEqual(rc, 2)
+        self.assertEqual(self.telemetry()[-1]["status"], "failed-usage")
+
+    def test_missing_key_exit_writes_telemetry(self):
+        real = M.api_key
+        M.api_key = lambda: None
+        self.addCleanup(setattr, M, "api_key", real)
+        rc, _ = self.run_main()
+        self.assertEqual(rc, 2)
+        self.assertEqual(self.telemetry()[-1]["status"], "failed-no-key")
 
     def telemetry(self):
         with open(self.log) as fh:
@@ -607,7 +651,7 @@ class ExecutorValidation(unittest.TestCase):
 
     def setUp(self):
         self._screen, self._lcu = M.SCREEN.copy(), M.lcu
-        M.SCREEN.update({"w": 1000, "h": 800})
+        M.SCREEN.update({"width": 1000, "height": 800})
         M.lcu = lambda *a: {"ok": True, "did": a[0]}
         self.addCleanup(lambda: (M.SCREEN.clear() or M.SCREEN.update(self._screen), setattr(M, "lcu", self._lcu)))
 
@@ -651,7 +695,7 @@ class ExecutorValidation(unittest.TestCase):
             self.assertFalse(payload["ok"], bad)
 
     def test_unknown_screen_disables_bounds_check_only(self):
-        M.SCREEN.update({"w": None, "h": None})
+        M.SCREEN.update({"width": None, "height": None})
         blocks, _ = M.run_tool("click", {"x": 99999, "y": 99999})
         self.assertTrue(json.loads(blocks[0]["text"])["ok"])
         # key and scroll validation do not depend on the screen size
@@ -697,7 +741,7 @@ class SleepPatcher(unittest.TestCase):
 class RetryBackoff(SleepPatcher):
     def _call(self, conn):
         return M.call_model("k", [{"role": "user", "content": "hi"}], False, conn,
-                            deadline=time.time() + 600)
+                            deadline=time.time() + 600, system="s")
 
     def test_429_then_success_retries_and_succeeds(self):
         conn = FakeConn([FakeResp(429, b'{"type":"error"}', retry_after="1"), FakeResp(200, b'{"ok": true}')])
@@ -720,19 +764,21 @@ class RetryBackoff(SleepPatcher):
 class LadderDiscipline(SleepPatcher):
     def test_ladder_is_5_15_30_45_without_retry_after(self):
         conn = FakeConn([FakeResp(429, b"e")] * 5)
-        M.call_model("k", [{"role": "user", "content": "hi"}], False, conn, deadline=time.time() + 600)
+        M.call_model("k", [{"role": "user", "content": "hi"}], False, conn,
+                     deadline=time.time() + 600, system="s")
         self.assertEqual(self.sleeps, [5, 15, 30, 45])
 
     def test_retry_after_overrides_ladder(self):
         conn = FakeConn([FakeResp(429, b"e", retry_after="2"), FakeResp(200, b'{"ok":1}')])
-        out = M.call_model("k", [{"role": "user", "content": "hi"}], False, conn, deadline=time.time() + 600)
+        out = M.call_model("k", [{"role": "user", "content": "hi"}], False, conn,
+                           deadline=time.time() + 600, system="s")
         self.assertEqual(self.sleeps, [2])
         self.assertEqual(out, {"ok": 1})
 
     def test_deadline_stops_retrying(self):
         conn = FakeConn([FakeResp(429, b"e")] * 5)
         out = M.call_model("k", [{"role": "user", "content": "hi"}], False, conn,
-                           deadline=time.time() - 1)
+                           deadline=time.time() - 1, system="s")
         self.assertTrue(out["rate_limited"])
         self.assertEqual(self.sleeps, [])
 
