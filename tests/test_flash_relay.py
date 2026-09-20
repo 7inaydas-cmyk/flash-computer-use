@@ -154,6 +154,31 @@ class CrashGuard(unittest.TestCase):
             os.unlink(fifo)
 
 
+class LaunchApp(unittest.TestCase):
+    """A launch that dies instantly must be a diagnosable tool error, not a
+    silent success: a snap Firefox that refused to start once burned a whole
+    rehearsal round while the worker screenshot for a window that never came."""
+
+    def test_child_env_carries_display(self):
+        self.assertIn("DISPLAY", M.CHILD_ENV)
+
+    def test_early_exit_is_reported_with_code(self):
+        res = M.launch_app(["/bin/false"])
+        self.assertFalse(res["ok"])
+        self.assertIn("exited immediately", res["error"])
+        self.assertIn("do not keep retrying", res["error"])
+
+    def test_surviving_launch_is_reported_detached(self):
+        res = M.launch_app(["sleep", "30"])
+        self.assertTrue(res["ok"])
+        self.assertIn("detached", res["note"])
+
+    def test_unstartable_binary_is_reported(self):
+        res = M.launch_app(["/nonexistent/binary"])
+        self.assertFalse(res["ok"])
+        self.assertIn("failed to start", res["error"])
+
+
 class BashAllowlist(unittest.TestCase):
     """The bash tool was a 12-pattern denylist; every bypass class from the
     evaluation must now be refused by the allowlist, and the legitimate
