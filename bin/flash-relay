@@ -5,15 +5,24 @@ Drives the real X11 desktop via the lcu CLI, with the model called directly
 over the Anthropic-compatible GLM API. Bypasses the zcode subagent registry
 entirely, so it works regardless of desktop-side provider state.
 
-Protocol carried in code, not prompt-hope:
-  - hard action cap (default 40) and wall-clock cap (default 480 s)
-  - vision gate: the first tool round MUST be a screenshot; if the model
-    cannot describe it, abort (blind runs are not allowed to continue)
-  - lcu-only actuation surface (plus a constrained bash tool for app launch
-    and file oracles)
-  - final output is the standing report template
+Enforced in code, structurally:
+  - one tool call per model turn; batched calls are refused
+  - vision gate: the run's first tool call must be one full screenshot,
+    and no action runs before it
+  - fresh-frame rule: every action needs a screenshot result since the
+    previous action
+  - hard action cap (default 40; ACTION_BUDGET in the brief or the
+    --max-actions flag): at the cap, no action executes at all
+  - bash tool runs an allowlist (read/oracle binaries, GUI launchers),
+    shlex-parsed and executed without a shell
+  - crash guards: malformed model turns and tool errors become tool errors
+    or driver reports, never tracebacks; every exit writes telemetry
 
-Usage: flash-relay.py <brief-file> [--max-actions N] [--timeout-s S]
+Still prompt-enforced, behavioural and backstopped by the structural rules
+above: blindness recognition, CAPTCHA and wall detection on each frame,
+AUTHORIZED interpretation, the final report's content.
+
+Usage: flash-relay <brief-file> [--max-actions N] [--timeout-s S] [--thinking]
 """
 from __future__ import annotations
 
@@ -22,6 +31,7 @@ import http.client
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -30,12 +40,16 @@ import urllib.parse
 LCU = os.environ.get("LCU_BIN", os.path.expanduser("~/.local/bin/lcu"))
 API = "https://api.z.ai/api/anthropic/v1/messages"
 MODEL = "GLM-5.3-Flash"
+DEFAULT_MAX_ACTIONS = 40
+DEFAULT_TIMEOUT_S = 480
+BASH_TIMEOUT_S = 60
+LCU_TIMEOUT_S = 60
 
 TOOLS = [
     {"name": "screenshot",
      "description": "Capture the screen (or a window/region) and VIEW it. Use before every action; never act on a stale frame. Coordinates in region/window captures are relative: add region x/y.",
-      "input_schema": {"type": "object", "properties": {
-          "window": {"type": "string", "description": "'active', window id, or name substring. Omit for full screen."},
+     "input_schema": {"type": "object", "properties": {
+          "window": {"type": "string", "description": "'active', window id, or name substring. Omit for full screen. The FIRST screenshot of a run must be full screen."},
           "region": {"type": "array", "items": {"type": "integer"}, "minItems": 4, "maxItems": 4, "description": "[x,y,w,h] absolute-screen crop (zoom for small targets)."},
           "scale": {"type": "number", "description": "Downscale factor, e.g. 0.75. Divide image coords by it before clicking."}},
       }},
@@ -46,7 +60,7 @@ TOOLS = [
          "count": {"type": "integer", "description": "2 = double-click"}}}},
     {"name": "type_text", "description": "Type literal text into the focused window. Focus the right window and click the field first.",
      "input_schema": {"type": "object", "required": ["text"], "properties": {"text": {"type": "string"}}}},
-    {"name": "press_key", "description": "Press key combos, e.g. ctrl+s, Return, ctrl+w.",
+    {"name": "press_key", "description": "Press key combos. keys must be an ARRAY of combo strings, e.g. [\"ctrl+s\", \"Return\"].",
      "input_schema": {"type": "object", "required": ["keys"], "properties": {
          "keys": {"type": "array", "items": {"type": "string"}}}}},
     {"name": "scroll", "description": "Scroll the wheel.",
@@ -56,49 +70,55 @@ TOOLS = [
     {"name": "drag", "description": "Press at (x1,y1), move, release at (x2,y2).",
      "input_schema": {"type": "object", "required": ["x1", "y1", "x2", "y2"], "properties": {
          "x1": {"type": "integer"}, "y1": {"type": "integer"}, "x2": {"type": "integer"}, "y2": {"type": "integer"}}}},
-    {"name": "list_windows", "description": "List visible windows with ids, titles, geometry.",
+    {"name": "list_windows", "description": "List visible windows with ids, titles, geometry, pid.",
      "input_schema": {"type": "object", "properties": {}}},
-    {"name": "focus_window", "description": "Activate/raise a window by 'active', id, or name substring. Do this before typing.",
+    {"name": "focus_window", "description": "Activate/raise a window by 'active', id, or name substring. Ambiguous names are an error; use an id from list_windows. Do this before typing.",
      "input_schema": {"type": "object", "required": ["window"], "properties": {"window": {"type": "string"}}}},
-    {"name": "bash", "description": "Run a shell command. ONLY for: launching the target app (backgrounded), reading files the GUI wrote (cat/ls), and other non-GUI parts the brief allows. Never for image processing, downloads, or anything on the FORBIDDEN list.",
+    {"name": "bash", "description": "Run ONE allowlisted command, no shell features. Allowed: read/oracle binaries (cat, ls, head, tail, wc, file, stat, grep, pgrep, ps, echo, pwd, which, date, du, df) and GUI app launches (e.g. gnome-text-editor FILE, firefox URL). Pipes, ;, &&, ||, redirection, $, backticks and multiple commands are refused. Input automation must use press_key/type_text, not xdotool.",
      "input_schema": {"type": "object", "required": ["command"], "properties": {"command": {"type": "string"}}}},
 ]
 
-SYSTEM = """You are flash-worker, a computer-use worker driving the user's REAL X11 desktop through LCU tools. You execute exactly one bounded GUI subtask (given in the user message), then report. You never talk to the user directly.
+SYSTEM_TEMPLATE = """You are flash-worker, a computer-use worker driving the user's REAL X11 desktop through LCU tools. You execute exactly one bounded GUI subtask (given in the user message), then report. You never talk to the user directly.
 
-# Vision gate (your FIRST screenshot, every run)
+# Driver enforcement (structural, not negotiable)
+The driver executes exactly ONE tool call per model turn; extra calls in a turn are refused. Every action (anything except screenshot and list_windows) requires a fresh screenshot result since your last action. The run's FIRST tool call must be one FULL screenshot (no window, no region); nothing else runs before it. Past the action cap ({max_actions} actions) no action executes at all. The bash tool runs an allowlist: single read/oracle commands and GUI app launches only; everything else is refused.
+
+# Vision gate (first frame, every run)
 Your FIRST tool call must be a full screenshot. Two checks on that one frame:
 1. If you cannot actually see and describe its contents, STOP and output the report with STATUS: failed and ANOMALIES: "VISION-BROKEN: cannot view images". Never compensate with image processing, crops via bash, or OCR. A blind run must cost one screenshot.
-2. Scan the frame for a CAPTCHA, a no-AI attestation, or a login wall on your target that the brief did not declare. If one is visible, STOP RIGHT THERE: zero typing, zero clicking, zero filling. Output STATUS: needs-escalation naming the gate. A form behind an undeclared wall is dead on arrival; filling it first wastes the run. (If the brief DECLARES the gate, or the AUTHORIZED: line covers passing it, proceed as briefed.)
+2. Scan the frame for a CAPTCHA, a no-AI attestation, or a login wall on your target that the brief did not declare. If one is visible, STOP RIGHT THERE: zero typing, zero clicking, zero filling. Output STATUS: needs-escalation naming the gate. (If the brief DECLARES the gate, or the AUTHORIZED: line covers passing it, proceed as briefed.)
+Both checks apply to EVERY frame of the run, not only the first: any CAPTCHA, attestation, undeclared login wall, or MFA/SSO consent prompt that appears mid-run stops the run the same way. Screenshot it, then report needs-escalation. Never fill first.
 
 # The loop (strict)
 1. LOOK - screenshot before every single action. Never act on a stale frame.
 2. DECIDE - exactly one action that moves the subtask forward.
-3. ACT - issue it.
-4. VERIFY - screenshot again; confirm the expected change. If it did not happen, do not repeat the same action; re-observe, diagnose, change approach.
+3. ACT - issue it alone; the driver refuses batched calls.
+4. VERIFY - screenshot again; confirm the expected change. If it did not happen, do not repeat the same action; re-observe, diagnose, change approach. A changed approach must stay inside AUTHORIZED and the brief; if it would leave them, report needs-escalation instead of improvising.
 
 # Accuracy discipline
 - Click coordinates only from the most recent screenshot. Recompute after any scroll, window change, or animation.
-- Small or ambiguous target: capture its region first, compute the coordinate there, offset by the region origin.
+- Small target: capture its region first, compute the coordinate there, offset by the region origin.
+- Ambiguity is a stop, not a choice: if the brief-named option is absent, or two look-alike candidates match it (near-duplicate rows, similarly named entries), do NOT pick the nearest match. Report STATUS: needs-escalation naming the candidates. A wrong-but-completed action is worse than a blocked run.
 - Before typing: focus the right window and click the exact field. After typing, verify the text landed.
 - Prefer keyboard navigation (Tab, arrows, shortcuts) when reliable.
+- Unexpected dialogs or popups: screenshot and read them. Dismiss (Escape) only if clearly cosmetic. If the brief carries CRITICAL: true, do not dismiss or route through anything: report needs-escalation with the screenshot.
 
 # Forms and irreplaceable state
 - NEVER navigate, reload, refresh, or close a browser tab that contains a filled but unsubmitted form. Open your target site in a NEW tab and leave every other tab exactly as found.
 - If the target form is already partially filled (a previous run may have got that far), CONTINUE from it. Never navigate or reload to "start fresh"; that destroys work.
 - Verify typed values cheaply (field echo, tab order, one screenshot per form section). Per-field screenshot verification is not your job.
 
-# Early aborts - report needs-escalation IMMEDIATELY, before acting
-- CAPTCHA / no-AI attestation / undeclared login wall: see the vision gate; abort on the first frame, never fill first.
-- If the brief carries no AUTHORIZED: line, the standing prohibitions below apply in full. An AUTHORIZED: line permits exactly what it names (for example "click the Submit button on this application") and nothing beyond it.
+# AUTHORIZED is a closed whitelist
+An AUTHORIZED: line names the ONLY non-read-only actions you may perform this run, exactly as worded, and nothing beyond them. If the brief carries no AUTHORIZED: line, every non-read-only action is out of bounds. If you cannot tell whether a planned action is covered by AUTHORIZED, it is not covered: report STATUS: needs-escalation instead of acting.
 
 # Hard prohibitions - report STATUS: needs-escalation instead of doing
 - Typing passwords, tokens, 2FA codes.
 - Sending/submitting anything with external effect: messages, emails, posts, orders, payments.
+- Provisioning or spending on cloud services or any paid platform: instances, storage, deployments, subscriptions.
 - Deleting files; closing/resizing apps other than your target; sudo; system settings; anything irreversible.
 
 # Budget
-Hard cap: the action budget in the brief (default 40). Screenshots are free. Three failed attempts at one goal-step: STOP, report blocked. Do not thrash.
+Hard cap: {max_actions} actions, enforced by the driver: past the cap no action executes, so when the driver announces the budget is reached, stop and output your final report immediately. Screenshots are free. Three failed attempts at one goal-step: STOP, report blocked. Do not thrash.
 
 # Report - your final message MUST be exactly this template
 STATUS: done | blocked | failed | needs-escalation
@@ -106,11 +126,21 @@ STEPS: <number> total
   - <one line per action, in order>
 EVIDENCE:
   - <paths of key screenshots: initial, final>
+PRODUCED:
+  - <machine-checkable artifacts the task created, one per line: file paths, instance or resource ids, sent message ids; "none" if none>
 ANOMALIES: <unexpected things seen or done; "none" if none>
 RESULT: <one paragraph: end state and whether the brief's acceptance criteria are met>
 FINDINGS: <optional; MANDATORY for read/verify briefs: one line per question the brief asked, each with its verdict and the evidence behind it>
 
-Be honest: the driver verifies every done claim independently."""
+Be honest: a verified "blocked" beats an optimistic "done"; the orchestrator verifies every done claim independently."""
+
+SYSTEM = SYSTEM_TEMPLATE.format(max_actions=DEFAULT_MAX_ACTIONS)
+
+REPORT_REQUIRED_MARKERS = ("STATUS:", "RESULT:")
+
+
+def build_system(max_actions: int) -> str:
+    return SYSTEM_TEMPLATE.format(max_actions=max_actions)
 
 
 def api_key() -> str:
@@ -131,11 +161,11 @@ def api_key() -> str:
 RETRY_LADDER = (5, 15, 30, 45)
 
 
-def call_model(key: str, messages: list, thinking: bool, conn, deadline: float) -> dict:
+def call_model(key: str, messages: list, thinking: bool, conn, deadline: float, system: str = SYSTEM) -> dict:
     body = {
         "model": MODEL,
         "max_tokens": 4096,
-        "system": [{"type": "text", "text": SYSTEM, "cache_control": {"type": "ephemeral"}}],
+        "system": [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
         "messages": messages,
         "tools": TOOLS,
     }
@@ -220,10 +250,15 @@ def prune_old_images(messages: list) -> None:
 
 
 def lcu(*args: str) -> dict:
+    if any("\x00" in str(a) for a in args):
+        return {"ok": False, "error": "NUL byte in arguments; refused"}
     try:
-        proc = subprocess.run([LCU, *args], capture_output=True, text=True, timeout=60)
+        proc = subprocess.run([LCU, *args], capture_output=True, text=True, timeout=LCU_TIMEOUT_S)
     except subprocess.TimeoutExpired:
-        return {"ok": False, "error": "lcu timed out"}
+        return {"ok": False, "error": f"lcu call timed out after {LCU_TIMEOUT_S}s; the input may have taken effect; "
+                                      "do not retry blindly: screenshot first and verify the resulting state"}
+    except (OSError, ValueError) as e:
+        return {"ok": False, "error": f"lcu failed to run: {e}"}
     for line in reversed((proc.stdout or "").splitlines()):
         try:
             return json.loads(line)
@@ -243,8 +278,13 @@ def do_screenshot(a: dict) -> list:
     res = lcu(*args)
     if not res.get("ok"):
         return [{"type": "text", "text": f"screenshot failed: {res.get('error')}"}]
-    path = res["path"]
-    size = os.path.getsize(path)
+    path = res.get("path")
+    if not path:
+        return [{"type": "text", "text": "screenshot failed: lcu returned no path"}]
+    try:
+        size = os.path.getsize(path)
+    except OSError as e:
+        return [{"type": "text", "text": f"screenshot failed: {e}"}]
     if size > 4_000_000:
         return [{"type": "text", "text": f"screenshot too large ({size} bytes); retry with scale. Saved {path}"}]
     with open(path, "rb") as fh:
@@ -254,18 +294,126 @@ def do_screenshot(a: dict) -> list:
             {"type": "text", "text": path + " " + json.dumps(meta)}]
 
 
-# Minimal blocklist for the bash tool. The prompt held for weeks of runs,
-# but this is the one tool where a hallucination reaches the system.
-BASH_BLOCKLIST = (
-    re.compile(r"\bsudo\b"), re.compile(r"\brm\b"), re.compile(r"\bdd\b"),
-    re.compile(r"\bmkfs"), re.compile(r"\bcurl\b"), re.compile(r"\bwget\b"),
-    re.compile(r"\bshutdown\b"), re.compile(r"\breboot\b"), re.compile(r"\bsystemctl\b"),
-    re.compile(r"\|\s*(ba)?sh\b"), re.compile(r"/dev/sd"), re.compile(r"chmod\s+777"),
-)
+# --- bash allowlist ------------------------------------------------------
+# The bash tool is arbitrary code execution unless the policy makes it
+# otherwise. A denylist cannot (bypasses: base64 pipes, variable expansion,
+# interpreters, redirection); an allowlist of binaries with the shell
+# features refused outright can. bash_policy is pure: parse, decide, return.
+
+ORACLE_BINARIES = frozenset({
+    "cat", "ls", "head", "tail", "wc", "file", "stat", "grep", "egrep",
+    "pgrep", "ps", "echo", "pwd", "which", "date", "du", "df", "id", "uname",
+})
+LAUNCH_BINARIES = frozenset({
+    "gnome-text-editor", "gedit", "mousepad", "gvim", "firefox", "chromium",
+    "chromium-browser", "google-chrome", "google-chrome-stable", "nautilus",
+    "xdg-open", "eog", "evince", "libreoffice", "gnome-terminal", "kgx", "code",
+})
+ALLOWED_BASH = ORACLE_BINARIES | LAUNCH_BINARIES | {"nohup"}
+
+FORBIDDEN_SHELL_CHARS = set(";|&><$(){}[]*?`\\")
+FORBIDDEN_CONTROL = ("\n", "\r", "\x00")
 
 
-def bash_blocked(command: str) -> bool:
-    return any(pat.search(command) for pat in BASH_BLOCKLIST)
+def bash_policy(command) -> tuple:
+    """Decide whether a bash tool command may run, and in what shape.
+
+    Returns (argv, launch, reason): argv is None when the command is
+    refused and reason says why; launch is True for GUI app launches,
+    which the driver always detaches.
+    """
+    if not isinstance(command, str):
+        return None, False, "command must be a string"
+    s = command.strip()
+    if not s:
+        return None, False, "empty command"
+    if any(c in s for c in FORBIDDEN_CONTROL):
+        return None, False, "control characters (newline or NUL) in command; exactly one command line is allowed"
+    # a single trailing & (launch style) is stripped and ignored: launch
+    # binaries are always detached by the driver regardless
+    if s.endswith("&"):
+        s = s[:-1].strip()
+    if not s:
+        return None, False, "empty command"
+    bad = sorted(set(s) & FORBIDDEN_SHELL_CHARS)
+    if bad:
+        return None, False, (f"shell feature characters refused: {' '.join(bad)}; "
+                             "the bash tool runs ONE allowlisted command with no pipes, "
+                             "redirection, expansion, or chaining")
+    try:
+        tokens = shlex.split(s)
+    except ValueError as e:
+        return None, False, f"unparsable command ({e}); quote paths with spaces instead"
+    if not tokens:
+        return None, False, "empty command"
+    if tokens[0] == "nohup":
+        tokens = tokens[1:]
+    if not tokens:
+        return None, False, "empty command"
+    if "=" in tokens[0]:
+        return None, False, "environment assignment prefixes are not allowed"
+    binary = tokens[0]
+    if binary not in ALLOWED_BASH:
+        return None, False, f"'{binary}' is not on the bash allowlist"
+    argv = [os.path.expanduser(t) for t in tokens]
+    return argv, binary in LAUNCH_BINARIES, ""
+
+
+# --- safety policy --------------------------------------------------------
+
+READONLY_TOOLS = frozenset({"screenshot", "list_windows"})
+
+
+def is_action_tool(name: str) -> bool:
+    return name not in READONLY_TOOLS
+
+
+class SafetyPolicy:
+    """Every structural safety bound of the driving loop behind one interface.
+
+    admit(name, input, index_in_turn) answers "may this call run?" and
+    record(name, input, blocks) is told what ran. The loop owns no policy
+    of its own; tests drive this class directly, no display needed.
+    """
+
+    def __init__(self, max_actions: int):
+        self.max_actions = max_actions
+        self.actions = 0
+        self.first_frame_taken = False
+        self.fresh_frame = False
+        self.refusals = 0
+
+    def admit(self, name, a, index_in_turn):
+        a = a if isinstance(a, dict) else {}
+        if index_in_turn > 0:
+            return False, ("driver rule: one tool call per turn; only the first call of a turn "
+                           "executes and the rest are refused. Re-observe with a screenshot, "
+                           "then issue your next call alone.")
+        if is_action_tool(name):
+            if self.actions >= self.max_actions:
+                return False, (f"action budget reached ({self.actions}/{self.max_actions}); "
+                               "the driver will execute no further action. Output your final report now.")
+            if not self.first_frame_taken:
+                return False, ("vision gate: the first tool call of the run must be one FULL screenshot "
+                               "(no window, no region). Take it now, apply the vision-gate checks, "
+                               "then continue.")
+            if not self.fresh_frame:
+                return False, ("fresh-frame rule: take a screenshot (and look at it) before this "
+                               "action; acting on a stale frame is refused.")
+        elif name == "screenshot" and not self.first_frame_taken:
+            if a.get("window") or a.get("region"):
+                return False, ("vision gate: the FIRST screenshot of the run must be full-frame "
+                               "(no window, no region); later screenshots may crop.")
+        return True, ""
+
+    def record(self, name, a, blocks):
+        if name == "screenshot" and any(isinstance(b, dict) and b.get("type") == "image" for b in blocks):
+            self.fresh_frame = True
+            if not (a.get("window") or a.get("region")):
+                self.first_frame_taken = True
+        if is_action_tool(name):
+            self.actions += 1
+            self.fresh_frame = False
 
 
 def rounds_cap(max_actions: int) -> int:
@@ -289,23 +437,47 @@ def record_run(runs_path: str, entry: dict) -> None:
 
 
 def run_tool(name: str, a: dict) -> tuple[list, bool]:
-    """Execute a tool; returns (content blocks, counts_as_action).
+    """Execute one admitted tool call; returns (content blocks, counts_as_action).
 
-    A malformed call (missing required key) is reported back to the model as
-    a tool error so it can retry correctly; it never crashes the run.
+    A malformed or hostile call is reported back to the model as a tool
+    error so it can retry correctly; nothing here may raise.
     """
     try:
         if name == "screenshot":
             return do_screenshot(a), False
-        if name == "bash" and bash_blocked(a["command"]):
-            res = {"ok": False, "error": "command blocked by the driver safety list; the bash tool is for app launch, cat/ls, and brief-allowed non-GUI steps only"}
+        if name == "bash":
+            argv, launch, reason = bash_policy(a.get("command"))
+            if argv is None:
+                res = {"ok": False, "error": f"command refused: {reason}"}
+            elif launch:
+                subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 start_new_session=True)
+                res = {"ok": True, "note": "launch command detached; verify the window via "
+                                           "screenshot or list_windows before interacting"}
+            else:
+                try:
+                    proc = subprocess.run(argv, capture_output=True, text=True, timeout=BASH_TIMEOUT_S)
+                    res = {"ok": proc.returncode == 0, "stdout": proc.stdout[-1500:], "stderr": proc.stderr[-500:]}
+                except subprocess.TimeoutExpired:
+                    res = {"ok": False, "error": f"bash command timed out after {BASH_TIMEOUT_S}s and was killed; "
+                                                 "it may have partially taken effect; do not retry it blindly"}
         elif name == "click":
             res = lcu("click", str(a["x"]), str(a["y"]), "--button", a.get("button", "left"),
                       "--count", str(a.get("count", 1)))
         elif name == "type_text":
-            res = lcu("type", a["text"])
+            text = a.get("text")
+            if not isinstance(text, str):
+                res = {"ok": False, "error": "type_text requires text as a string"}
+            else:
+                res = lcu("type", text)
         elif name == "press_key":
-            res = lcu("key", *[str(k) for k in a["keys"]])
+            keys = a.get("keys")
+            if (not isinstance(keys, list) or not keys
+                    or not all(isinstance(k, str) and k.strip() for k in keys)):
+                res = {"ok": False, "error": "press_key requires keys as an ARRAY of combo strings, "
+                                             "e.g. [\"ctrl+s\", \"Return\"]"}
+            else:
+                res = lcu("key", *keys)
         elif name == "scroll":
             direction = a.get("direction")
             if direction not in ("up", "down", "left", "right"):
@@ -321,18 +493,19 @@ def run_tool(name: str, a: dict) -> tuple[list, bool]:
             res = lcu("windows")
         elif name == "focus_window":
             res = lcu("focus", str(a["window"]))
-        elif name == "bash":
-            proc = subprocess.run(a["command"], shell=True, capture_output=True, text=True, timeout=60)
-            res = {"ok": proc.returncode == 0, "stdout": proc.stdout[-1500:], "stderr": proc.stderr[-500:]}
         else:
             res = {"ok": False, "error": f"unknown tool {name}"}
     except KeyError as e:
         res = {"ok": False, "error": f"malformed tool call: missing required parameter {e}; retry with all required parameters"}
-    return [{"type": "text", "text": json.dumps(res)[:1500]}], name != "list_windows"
+    except Exception as e:  # noqa: BLE001 - a tool error must never crash the run
+        res = {"ok": False, "error": f"tool error ({type(e).__name__}): {e}"}
+    return [{"type": "text", "text": json.dumps(res)[:1500]}], is_action_tool(name)
 
 
 def parse_argv(argv: list) -> dict:
-    defaults = {"max_actions": 40, "timeout_s": 480, "thinking": False, "tag": ""}
+    """Numeric flags stay None when absent, so the caller can tell an
+    explicit flag from a default when merging with the brief's budget."""
+    out = {"max_actions": None, "timeout_s": None, "thinking": False, "tag": ""}
 
     def flag_value(flag):
         return argv[argv.index(flag) + 1] if flag in argv and argv.index(flag) + 1 < len(argv) else None
@@ -342,78 +515,140 @@ def parse_argv(argv: list) -> dict:
                             ("tag", "--tag", str)):
         value = flag_value(flag)
         if value is not None:
-            defaults[key] = cast(value)
-    defaults["thinking"] = "--thinking" in argv
-    return defaults
+            out[key] = cast(value)
+    out["thinking"] = "--thinking" in argv
+    return out
+
+
+def resolve_budget(brief: str, parsed: dict) -> dict:
+    """One source of truth for the cap: an explicit flag wins, else the
+    brief's ACTION_BUDGET line, else the default. The SYSTEM prompt and
+    the enforcement code therefore always agree on the number."""
+    out = dict(parsed)
+    m = re.search(r"^ACTION_BUDGET:\s*(\d+)\s*$", brief, re.MULTILINE)
+    brief_n = min(200, max(1, int(m.group(1)))) if m else None
+    if out["max_actions"] is None:
+        out["max_actions"] = brief_n if brief_n is not None else DEFAULT_MAX_ACTIONS
+    if out["timeout_s"] is None:
+        out["timeout_s"] = DEFAULT_TIMEOUT_S
+    return out
+
+
+def looks_like_report(text: str) -> bool:
+    return all(marker in text for marker in REPORT_REQUIRED_MARKERS)
 
 
 def main() -> int:
     brief_path = sys.argv[1] if len(sys.argv) > 1 else None
     if not brief_path or not os.path.exists(brief_path):
-        print("usage: flash-relay.py <brief-file> [--max-actions N] [--timeout-s S] [--thinking]", file=sys.stderr)
+        print("usage: flash-relay <brief-file> [--max-actions N] [--timeout-s S] [--thinking]", file=sys.stderr)
         return 2
-    options = parse_argv(sys.argv[2:])
+    with open(brief_path) as fh:
+        brief = fh.read().strip()
+    options = resolve_budget(brief, parse_argv(sys.argv[2:]))
     max_actions, timeout_s = options["max_actions"], options["timeout_s"]
     thinking, tag = options["thinking"], options["tag"]
 
-    brief = open(brief_path).read().strip()
     key = api_key()
-    host = urllib.parse.urlparse(API).netloc
-    conn = http.client.HTTPSConnection(host, timeout=180)
+    system = build_system(max_actions)
+    conn = http.client.HTTPSConnection(urllib.parse.urlparse(API).netloc, timeout=180)
     messages = [{"role": "user", "content": brief}]
-    actions, t0, rounds = 0, time.time(), 0
+    policy = SafetyPolicy(max_actions)
+    t0, rounds = time.time(), 0
+    malformed_turns = 0
+    template_nudged = False
 
     cap = rounds_cap(max_actions)
-    final_status = "blocked"
 
     def log_run(status, extra=None):
         record_run(RUNS_LOG, {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
                               "brief": os.path.abspath(brief_path), "tag": tag,
-                              "actions": actions, "rounds": rounds,
+                              "actions": policy.actions, "rounds": rounds,
+                              "refusals": policy.refusals, "max_actions": max_actions,
                               "duration_s": round(time.time() - t0, 1),
                               "status": status, **(extra or {})})
-    while rounds < cap and time.time() - t0 < timeout_s:
-        prune_old_images(messages)
-        resp = call_model(key, messages, thinking, conn, deadline=t0 + timeout_s)
-        rounds += 1
-        if resp.get("error") or resp.get("type") == "error":
-            kind = "rate-limited" if resp.get("rate_limited") else "api-error"
-            print(f"DRIVER: API error ({kind}): {json.dumps(resp)[:400]}")
-            if kind == "rate-limited":
-                print("DRIVER: the plan's request quota window is exhausted; wait ~60s before the next run.")
-            log_run("failed-" + kind, extra={"error": str(resp.get("error"))[:160]})
-            print("STATUS: failed\nSTEPS: %d\nEVIDENCE: n/a\nANOMALIES: %s after %d actions\nRESULT: run aborted on API failure" % (actions, kind, actions))
-            return 1
-        content = resp.get("content", [])
-        messages.append({"role": "assistant", "content": content})
-        tool_uses = [b for b in content if b.get("type") == "tool_use"]
-        texts = [b.get("text", "") for b in content if b.get("type") == "text"]
-        if not tool_uses:
-            final_status = "reported"
-            print("\n".join(t for t in texts if t))
-            log_run("reported")
-            return 0
-        results = []
-        for tu in tool_uses:
-            blocks, is_action = run_tool(tu["name"], tu.get("input") or {})
-            if is_action:
-                actions += 1
-            results.append({"type": "tool_result", "tool_use_id": tu["id"], "content": blocks})
-        messages.append({"role": "user", "content": results})
-        if actions >= max_actions:
-            messages.append({"role": "user", "content":
-                "DRIVER: action budget reached (%d). Stop acting now and output your final report." % actions})
-        if time.time() - t0 > timeout_s - 30:
-            messages.append({"role": "user", "content":
-                "DRIVER: wall-clock budget nearly exhausted. Output your final report now."})
-        if cap - rounds <= 2:
-            messages.append({"role": "user", "content":
-                "DRIVER: conversation round budget nearly exhausted. Output your final report now."})
-    if final_status != "reported":
+    try:
+        budget_announced = False
+        while rounds < cap and time.time() - t0 < timeout_s:
+            prune_old_images(messages)
+            resp = call_model(key, messages, thinking, conn, deadline=t0 + timeout_s, system=system)
+            rounds += 1
+            if resp.get("error") or resp.get("type") == "error":
+                kind = "rate-limited" if resp.get("rate_limited") else "api-error"
+                print(f"DRIVER: API error ({kind}): {json.dumps(resp)[:400]}")
+                if kind == "rate-limited":
+                    print("DRIVER: the plan's request quota window is exhausted; wait ~60s before the next run.")
+                log_run("failed-" + kind, extra={"error": str(resp.get("error"))[:160]})
+                print("STATUS: failed\nSTEPS: %d\nEVIDENCE: n/a\nANOMALIES: %s after %d actions\nRESULT: run aborted on API failure" % (policy.actions, kind, policy.actions))
+                return 1
+            content = resp.get("content")
+            if not isinstance(content, list):
+                content = []
+            messages.append({"role": "assistant", "content": content})
+            tool_uses = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_use"]
+            texts = [b["text"] for b in content
+                     if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str)]
+            if not tool_uses:
+                final_text = "\n".join(t for t in texts if t)
+                if final_text.strip():
+                    if looks_like_report(final_text) or template_nudged:
+                        print(final_text)
+                        log_run("reported" if looks_like_report(final_text) else "reported-no-template")
+                        return 0
+                    template_nudged = True
+                    messages.append({"role": "user", "content":
+                        "DRIVER: final message must follow the standing report template "
+                        "(STATUS/STEPS/EVIDENCE/PRODUCED/ANOMALIES/RESULT, plus FINDINGS when the brief asked questions). "
+                        "Output it now."})
+                    continue
+                malformed_turns += 1
+                if malformed_turns >= 3:
+                    print("DRIVER: three model turns with no usable content; aborting.")
+                    print("STATUS: failed\nSTEPS: 0\nEVIDENCE: n/a\nANOMALIES: empty model turns\nRESULT: no usable output")
+                    log_run("failed-empty-turns")
+                    return 1
+                messages.append({"role": "user", "content":
+                    "DRIVER: your last message had no usable content. Either issue exactly one "
+                    "tool call or output the final report template."})
+                continue
+            malformed_turns = 0
+            results = []
+            for i, tu in enumerate(tool_uses):
+                if not isinstance(tu, dict):
+                    tu = {}
+                name = tu.get("name") or ""
+                a = tu.get("input") if isinstance(tu.get("input"), dict) else {}
+                tid = tu.get("id") or f"malformed-{rounds}-{i}"
+                allowed, reason = policy.admit(name, a, i)
+                if not allowed:
+                    policy.refusals += 1
+                    results.append({"type": "tool_result", "tool_use_id": tid, "is_error": True,
+                                    "content": [{"type": "text", "text": "DRIVER refusal: " + reason}]})
+                    continue
+                blocks, _ = run_tool(name, a)
+                policy.record(name, a, blocks)
+                results.append({"type": "tool_result", "tool_use_id": tid, "content": blocks})
+            messages.append({"role": "user", "content": results})
+            if policy.actions >= max_actions and not budget_announced:
+                budget_announced = True
+                messages.append({"role": "user", "content":
+                    "DRIVER: action budget reached (%d/%d). No further action will execute. "
+                    "Output your final report now." % (policy.actions, max_actions)})
+            if time.time() - t0 > timeout_s - 30:
+                messages.append({"role": "user", "content":
+                    "DRIVER: wall-clock budget nearly exhausted. Output your final report now."})
+            if cap - rounds <= 2:
+                messages.append({"role": "user", "content":
+                    "DRIVER: conversation round budget nearly exhausted. Output your final report now."})
         print("DRIVER: budget/rounds exhausted without a final report.")
-        print("STATUS: blocked\nSTEPS: %d\nEVIDENCE: n/a\nANOMALIES: driver budget exhausted\nRESULT: no final report produced" % actions)
+        print("STATUS: blocked\nSTEPS: %d\nEVIDENCE: n/a\nANOMALIES: driver budget exhausted\nRESULT: no final report produced" % policy.actions)
         log_run("exhausted-no-report")
-    return 1
+        return 1
+    except Exception as e:  # noqa: BLE001 - a driver bug must still report and log
+        print(f"DRIVER: internal error: {type(e).__name__}: {e}")
+        print("STATUS: failed\nSTEPS: %d\nEVIDENCE: n/a\nANOMALIES: driver internal error\nRESULT: run aborted" % policy.actions)
+        log_run("crashed", extra={"error": f"{type(e).__name__}: {e}"[:160]})
+        return 1
 
 
 if __name__ == "__main__":

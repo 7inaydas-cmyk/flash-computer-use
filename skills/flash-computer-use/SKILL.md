@@ -11,8 +11,10 @@ Two-tier computer use: **you** (GLM 5.3 max effort) plan, gate, and verify;
 ## Architecture
 
 - Actuation surface: the `lcu` CLI (`~/.local/bin/lcu`): screenshot, windows,
-  focus, move, click, drag, scroll, cursor, type, key; JSON output. Also
-  registered as the `lcu` MCP server (`~/.openwork/lcu-mcp/server.py`) in
+  focus, move, click, drag, scroll, cursor, type, key; JSON output. The
+  `windows` listing includes each window's pid; `focus` by name is a literal
+  substring match that errors on ambiguity (use an exact id from `windows`).
+  Also registered as the `lcu` MCP server (`~/.openwork/lcu-mcp/server.py`) in
   `~/.zcode/cli/config.json`, so both you and the worker may use
   `mcp__lcu__*` tools.
 - Worker: the `flash-worker` subagent profile
@@ -53,6 +55,8 @@ Never let the worker (and do not yourself, without asking the user):
 - type passwords, tokens, or 2FA codes;
 - send/submit anything with external effect: messages, emails, posts,
   comments, orders, payments;
+- provision or spend on cloud services or any paid platform: instances,
+  storage, deployments, subscriptions;
 - delete files or anything irreversible;
 - run `sudo` or change system settings.
 
@@ -68,8 +72,13 @@ exactly this: it stopped and is waiting on a human decision relayed by you.
 - **Dispatch path (primary): `flash-relay`**: the standalone driver at
   `~/.local/bin/flash-relay` (source of truth: the repo). It calls
   GLM-5.3-Flash directly over the API with the worker protocol and LCU
-  tools, with the action cap, wall-clock cap, and vision gate enforced in
-  code. Invoke: `flash-relay <brief-file> [--max-actions N] [--timeout-s S]`.
+  tools. Enforced in code, structurally: one tool call per model turn, a
+  full screenshot before anything else runs, a fresh screenshot before
+  every action, a hard action cap (past it no action executes at all), and
+  a bash allowlist (read/oracle commands and GUI launches only; pipes,
+  redirection, expansion, and off-list binaries are refused). Invoke:
+  `flash-relay <brief-file> [--max-actions N] [--timeout-s S]`; the driver
+  also reads `ACTION_BUDGET:` from the brief unless the flag overrides it.
   The brief file is the inner SUBTASK brief (no relay-wrapper text needed).
   Model routing is guaranteed by construction (the driver pins
   `model: GLM-5.3-Flash`); no post-hoc assertion required.
@@ -109,12 +118,17 @@ exactly this: it stopped and is waiting on a human decision relayed by you.
   EXACT_TEXT: <literal strings to type, if any>
   ACCEPTANCE: <checkable end-state>
   FORBIDDEN: <task-specific additions to the standing prohibition list>
-  AUTHORIZED: <what the user explicitly permitted beyond read-only, e.g.
-  "click Submit on this application"; ABSENT means the escalation list
-  stands in full and submitting stays forbidden>
+  AUTHORIZED: <closed whitelist of the ONLY non-read-only actions the
+  worker may perform, e.g. "click Submit on this application". ABSENT
+  means every non-read-only action is out of bounds; the worker treats
+  unclear coverage as not covered and reports needs-escalation>
   RESUME: <optional; "the form may be partially filled; screenshot before
   any navigation and continue from what is there">
-  ACTION_BUDGET: <N, default 40>
+  ACTION_BUDGET: <N, default 40; the relay driver enforces this number
+  in code>
+  CRITICAL: <optional; "true" makes the worker stop and report on ANY
+  divergence or unexpected dialog instead of improvising; use for
+  irreversible or spend-bearing tasks>
   ```
 
 - Brief discipline for forms: verification at checkpoints is YOUR job, never
@@ -132,7 +146,11 @@ strongest oracle available, cheapest first:
 
 1. Shell oracle: file exists / contains the exact text; process running;
    `lcu windows` shows the expected window title.
-2. Flash re-observation: dispatch a tiny follow-up to the worker ("screenshot
+2. API or service oracle for provisioning-class tasks: verify the produced
+   identifiers (instance ids, resource names; the worker reports them under
+   PRODUCED) against the service's own CLI or state yourself. A window
+   title proves nothing about what was provisioned.
+3. Flash re-observation: dispatch a tiny follow-up to the worker ("screenshot
    X and describe it") when only pixels can settle it.
 
 Note: some main-tier models (including GLM-5.3) have text-only input and
@@ -146,7 +164,7 @@ Only then report success to the user, citing the oracle you used.
 
 | Knob | Default | Notes |
 |---|---|---|
-| Actions per subtask | 40 | brief may override; screenshots unlimited |
+| Actions per subtask | 40 | brief's ACTION_BUDGET or the flag; enforced in code; screenshots unlimited |
 | Wall clock per subtask | 8 min | covers slow apps and settle waits |
 | Extension | +20 (→60), once | only after reviewing the failure report and rewriting the brief |
 | Task checkpoint | ~200 cumulative actions | pause and check in with the user |
@@ -175,6 +193,10 @@ choosing):
 - Resume parsers INVENT employers and titles from formatting. Re-verify
   every field on the review page against the resume, not against what was
   typed.
+- Near-duplicate options (AMI rows, similarly named keys) make the worker
+  STOP by design rather than pick the closest match. Name exact labels in
+  the brief, and treat a needs-escalation naming two candidates as the
+  protocol working, not failing.
 - Long-idle forms expire mid-flight. If a submit returns to a blank or
   login page, report blocked with the evidence instead of refilling.
 - GNOME Text Editor's --new-window can RESTORE the user's saved drafts
@@ -201,7 +223,7 @@ GNOME applications are single-instance: one process can own several
 windows. Closing ONE window by id (xdotool windowclose) can end the
 process and destroy windows you never targeted, including the user's.
 Before closing any window by id, check how many windows its process owns
-(`ps -o pid= -C <app>` then match against `lcu windows` ids); if the app
+(each window's pid is in the `lcu windows` listing); if the app
 owns more than one, close via the app's own UI (ctrl+w inside that
 window) or not at all. Never assume "nobody else closed it" when a window
 you did not target disappears: your own earlier close is the first
@@ -209,8 +231,10 @@ suspect, and the user may be nowhere near the desk.
 
 ## Worker report interpretation
 
-The worker's final message is `STATUS / STEPS / EVIDENCE / ANOMALIES /
-RESULT`. Treat `ANOMALIES` seriously: anything the worker clicked that the
+The worker's final message is `STATUS / STEPS / EVIDENCE / PRODUCED /
+ANOMALIES / RESULT` (plus `FINDINGS` when the brief asked questions).
+PRODUCED carries the machine-checkable artifacts the task created; verify
+those against an oracle. Treat `ANOMALIES` seriously: anything the worker clicked that the
 brief did not ask for deserves your verification attention. If the report
 template is missing or mangled, trust only the EVIDENCE screenshots, not the
 prose.

@@ -33,7 +33,12 @@ def emit(**kw):
 
 
 def run(cmd: list[str], check: bool = True) -> str:
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        if check:
+            die(f"{cmd[0]} timed out after 30s")
+        return ""
     if check and proc.returncode != 0:
         die(f"{cmd[0]} failed: {(proc.stderr or proc.stdout).strip()[:400]}")
     return proc.stdout.strip()
@@ -127,16 +132,26 @@ def window_geometry(wid: str) -> dict:
 
 
 def resolve_window(spec: str) -> str:
-    """Accept 'active', a numeric window id, or a name substring."""
+    """Accept 'active', a numeric window id, or a title substring.
+
+    The spec is regex-escaped, so it matches literally as a substring
+    (parens and brackets in titles cannot break or distort the search).
+    Ambiguous matches are an error, not a silent pick: single-instance
+    GNOME apps own several windows from one process, and "the last match"
+    has focused the wrong window before. Use an exact id from `lcu windows`.
+    """
     if spec == "active":
         return run(["xdotool", "getactivewindow"])
     if spec.isdigit():
         return spec
-    out = run(["xdotool", "search", "--name", spec], check=False)
-    ids = [line for line in out.splitlines() if line.strip()]
+    out = run(["xdotool", "search", "--name", re.escape(spec)], check=False)
+    ids = [line.strip() for line in out.splitlines() if line.strip()]
     if not ids:
         die(f"no window matching name: {spec}")
-    return ids[-1]
+    if len(ids) > 1:
+        die(f"ambiguous window name '{spec}': {len(ids)} matches "
+            f"({', '.join(ids[:6])}); use an exact id from `lcu windows`")
+    return ids[0]
 
 
 def cmd_windows(args):
@@ -151,13 +166,18 @@ def cmd_windows(args):
         name = run(["xdotool", "getwindowname", wid], check=False)
         if not name:
             continue
+        # pid matters for close/focus decisions: single-instance GNOME apps
+        # own many windows from one process, and the windows listing is
+        # where callers check that before acting.
+        pid = run(["xdotool", "getwindowpid", wid], check=False)
         try:
             geo = window_geometry(wid)
         except SystemExit:
             continue
         if geo["width"] < 40 or geo["height"] < 40:
             continue
-        wins.append({"id": wid, "name": name, "active": wid == active, **geo})
+        wins.append({"id": wid, "pid": int(pid) if pid.strip().isdigit() else None,
+                     "name": name, "active": wid == active, **geo})
     emit(windows=wins, count=len(wins))
 
 

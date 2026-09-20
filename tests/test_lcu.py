@@ -67,7 +67,7 @@ class LcuIntegration(unittest.TestCase):
         self.assertIsInstance(d["windows"], list)
         self.assertEqual(d["count"], len(d["windows"]))
         for w in d["windows"]:
-            for field in ("id", "name", "x", "y", "width", "height", "active"):
+            for field in ("id", "pid", "name", "x", "y", "width", "height", "active"):
                 self.assertIn(field, w)
 
 
@@ -98,6 +98,62 @@ class LcuRegionBoundsUnit(unittest.TestCase):
         self.assertFalse(m.region_in_bounds((0, 0, 0, 10), 100, 100))
         self.assertFalse(m.region_in_bounds((0, 0, 10, 0), 100, 100))
         self.assertFalse(m.region_in_bounds((-1, 0, 10, 10), 100, 100))
+
+
+class LcuResolveWindowUnit(unittest.TestCase):
+    """resolve_window with a stubbed xdotool: literal substring semantics,
+    ambiguity is an error, never a silent pick."""
+
+    def setUp(self):
+        self.m = load_lcu()
+        self.seen = {}
+        m = self.m
+
+        def fake_run(cmd, check=True):
+            if cmd[1] == "getactivewindow":
+                return "9999"
+            if cmd[1] == "search":
+                self.seen["spec"] = cmd[3]
+                table = {m.re.escape(k): v for k, v in {
+                    "one": "1234",
+                    "many": "111\n222\n333",
+                    "Draft (2026": "1234"}.items()}
+                return table.get(cmd[3], "")
+            return ""
+        self._real_run = m.run
+        m.run = fake_run
+        self.addCleanup(setattr, m, "run", self._real_run)
+
+    def test_active_and_numeric_ids_pass_through(self):
+        self.assertEqual(self.m.resolve_window("active"), "9999")
+        self.assertEqual(self.m.resolve_window("4455"), "4455")
+
+    def test_unique_substring_resolves(self):
+        self.assertEqual(self.m.resolve_window("one"), "1234")
+
+    def test_spec_is_regex_escaped_literal_substring(self):
+        # parens in a title must not be treated as regex syntax
+        self.assertEqual(self.m.resolve_window("Draft (2026"), "1234")
+        self.assertEqual(self.seen["spec"], self.m.re.escape("Draft (2026"))
+
+    def test_ambiguous_match_is_an_error_not_a_silent_pick(self):
+        import contextlib, io
+        buf = io.StringIO()
+        with self.assertRaises(SystemExit), contextlib.redirect_stdout(buf):
+            self.m.resolve_window("many")
+        payload = json.loads(buf.getvalue().strip())
+        self.assertFalse(payload["ok"])
+        self.assertIn("ambiguous", payload["error"])
+        self.assertIn("111", payload["error"])
+
+    def test_no_match_is_an_error(self):
+        import contextlib, io
+        buf = io.StringIO()
+        with self.assertRaises(SystemExit), contextlib.redirect_stdout(buf):
+            self.m.resolve_window("nothing-matches-this")
+        payload = json.loads(buf.getvalue().strip())
+        self.assertFalse(payload["ok"])
+        self.assertIn("no window matching", payload["error"])
 
 
 class LcuUnit(unittest.TestCase):

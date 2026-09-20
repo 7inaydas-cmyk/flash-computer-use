@@ -1,6 +1,7 @@
 SUBTASK: Prove the flash-relay computer-use stack end to end by creating a file through the GUI text editor.
 
-APP: GNOME Text Editor (gedit works the same). If an editor window is already open with your own document, do NOT touch it. Launch a NEW instance with the bash tool: nohup gnome-text-editor --new-window </dev/null >/dev/null 2>&1 &
+APP: GNOME Text Editor (gedit works the same). If an editor window is already open with your own document, do NOT touch it. Launch a NEW instance with the bash tool: nohup gnome-text-editor --new-window &
+(the driver detaches the launch itself; no redirections, they are refused)
 then wait about 2 seconds and screenshot to see the new untitled window.
 
 STEPS_HINT (you re-plan from screenshots; this is only a hint):

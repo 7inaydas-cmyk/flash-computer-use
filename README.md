@@ -18,7 +18,7 @@ sense, and the safety rules below exist because of it.
 | Piece | What it is |
 |---|---|
 | `bin/lcu` | Linux Computer Use: a single-file X11 CLI. xdotool for input, ffmpeg x11grab for capture, one JSON line per subcommand. Includes `screenshot --region X Y W H` for full-resolution crops of small targets. |
-| `bin/flash-relay` | The dispatch driver. Calls GLM-5.3-Flash directly over the Anthropic-compatible API with the worker protocol as its system prompt and lcu as its tool surface. Action cap, wall clock, and the report format are enforced in code, not in prompt hope. |
+| `bin/flash-relay` | The dispatch driver. Calls GLM-5.3-Flash directly over the Anthropic-compatible API with the worker protocol as its system prompt and lcu as its tool surface. Structural enforcement in code: one tool call per model turn, screenshot before anything else runs, a fresh screenshot before every action, a hard action cap (no action executes past it), a bash allowlist, and crash guards that always leave a report and a telemetry line. |
 | `agents/flash-worker.md` | A ZCode subagent profile for spawning workers from an interactive session. Same protocol as the driver. |
 | `skills/flash-computer-use/SKILL.md` | The orchestration skill your main agent loads: task decomposition, the escalation list, brief format, budgets, verification duty. |
 | `mcp/lcu-mcp-server.py` | Optional MCP wrapper around lcu, so agents get first-class screenshot/click/type tools. |
@@ -93,8 +93,15 @@ STEPS_HINT: <optional ordered hints>
 EXACT_TEXT: <literal strings>
 ACCEPTANCE: <checkable end state>
 FORBIDDEN: <additions to the standing prohibition list>
+AUTHORIZED: <closed whitelist of the ONLY non-read-only actions allowed;
+ABSENT means read-only only>
 ACTION_BUDGET: 40
+CRITICAL: true only for irreversible or spend-bearing tasks
 ```
+
+The driver reads `ACTION_BUDGET` from the brief (the `--max-actions` flag
+overrides it) and stops executing actions the moment the cap is hit, so
+the number in the brief and the number enforced are always the same.
 
 Run it, hands off the mouse and keyboard until it finishes:
 
@@ -109,17 +116,43 @@ editor smoke test, a 1920x1200 screen) the loop finished in 2m52s at nine
 actions with thinking off, versus 3m45s at nineteen actions with it on.
 
 The worker's final message is a fixed report: STATUS, STEPS, EVIDENCE,
-ANOMALIES, RESULT. Do not trust a `STATUS: done` without an oracle: a file
-that contains the exact expected text, a window title, a process check.
-Cheapest first, pixels last, and if your main model is text-only (GLM-5.3
-is), pixels are the worker's job, not yours.
+PRODUCED, ANOMALIES, RESULT. PRODUCED lists machine-checkable artifacts
+(file paths, resource ids) for your oracle. Do not trust a
+`STATUS: done` without one: a file that contains the exact expected text,
+a window title, a process check. Cheapest first, pixels last, and if your
+main model is text-only (GLM-5.3 is), pixels are the worker's job, not
+yours. For provisioning-class tasks, verify produced ids against the
+service's own CLI or state; a window title proves nothing about what was
+provisioned.
 
 ## Safety model
 
-The standing prohibition list, which the orchestrator enforces by never
-writing such a brief, and the worker enforces by reporting
-`needs-escalation` instead of acting: credentials and 2FA codes, anything
-with external effect (messages, email, posts, orders, payments), deletions,
+Two layers, and the code one does not depend on the model behaving.
+
+Structural, in the driver, always on:
+
+- One tool call per model turn; batched calls are refused, so one confused
+  turn cannot chain a submit sequence.
+- The first tool call of a run must be a full screenshot, and every action
+  needs a fresh screenshot since the previous one; no acting blind or on
+  stale frames.
+- A hard action cap (brief `ACTION_BUDGET`, default 40): past it, nothing
+  executes, no matter what the model emits.
+- The bash tool is an allowlist, not a denylist: one command line, one
+  allowed binary (read/oracle commands such as cat, ls, grep, pgrep; GUI
+  launchers), no pipes, redirection, expansion, or chaining, executed
+  without a shell. An `aws`, `terraform`, `python3`, or `xdotool` command
+  is refused outright.
+- Crash guards: malformed model turns and tool errors become tool errors
+  the model can correct, never tracebacks; every exit writes a telemetry
+  line.
+
+Behavioural, in the worker prompt, backstopped by the structural layer:
+the standing prohibition list, which the orchestrator enforces by never
+writing such a brief and the worker enforces by reporting
+`needs-escalation` instead of acting. Credentials and 2FA codes; anything
+with external effect (messages, email, posts, orders, payments);
+provisioning or spending on cloud services or any paid platform; deletions,
 sudo, system settings, anything irreversible. Budgets: 40 actions and 8
 minutes per subtask by default, one extension after a reviewed failure, a
 checkpoint with the human around 200 cumulative actions. If a report's
@@ -132,7 +165,9 @@ anything else says: stop, and check whether unsaved state was destroyed.
   pin and silently run the worker on the session model. The account-qualified
   ref is the candidate fix; until you have seen a session-spawned worker pass
   the database model check on your install, treat `flash-relay` as the only
-  proven path.
+  proven path. This is also why the shipped profile pins the bare
+  `GLM-5.3-Flash` while the author's live copy uses the account-qualified
+  ref: that one line is the only intended difference between the two.
 - Headless `zcode --prompt` broke entirely on the author's machine after
   connecting account-level coding plans in the desktop app ("Select a model
   before continuing"). That is why flash-relay exists: it needs no registry,
