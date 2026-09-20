@@ -73,9 +73,12 @@ exactly this: it stopped and is waiting on a human decision relayed by you.
   `~/.local/bin/flash-relay` (source of truth: the repo). It calls
   GLM-5.3-Flash directly over the API with the worker protocol and LCU
   tools. Enforced in code, structurally: one tool call per model turn, a
-  full screenshot before anything else runs, a fresh screenshot before
-  every action, a hard action cap (past it no action executes at all), and
-  a bash allowlist (read/oracle commands and GUI launches only; pipes,
+  full screenshot before anything else runs, a fresh frame before every
+  action (the driver attaches a post-action screenshot to every action
+  result, so consecutive actions spend no round on a LOOK), a hard action
+  cap (past it no action executes at all), executor-side validation of
+  model-emitted coordinates, key combos, and scroll amounts, and a bash
+  allowlist (read/oracle commands and GUI launches only; pipes,
   redirection, expansion, and off-list binaries are refused). Invoke:
   `flash-relay <brief-file> [--max-actions N] [--timeout-s S]`; the driver
   also reads `ACTION_BUDGET:` from the brief unless the flag overrides it.

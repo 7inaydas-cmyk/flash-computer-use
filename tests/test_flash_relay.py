@@ -363,7 +363,8 @@ class SystemPromptGates(unittest.TestCase):
 
     def test_new_protocol_rules_present(self):
         for needle in ("PRODUCED:", "closed whitelist", "ONE tool call per model turn",
-                       "Ambiguity is a stop", "cloud services", "CRITICAL: true"):
+                       "Ambiguity is a stop", "cloud services", "CRITICAL: true",
+                       "post-action screenshot attached", "rides along with every action result"):
             self.assertIn(needle, M.SYSTEM, needle)
 
     def test_build_system_carries_the_real_cap(self):
@@ -562,22 +563,100 @@ class VisionGateLoop(LoopHarness):
         self.assertEqual(self.telemetry()[-1]["status"], "reported")
 
 
-class FreshFrameLoop(LoopHarness):
+class PiggybackLoop(LoopHarness):
+    """The jev-ultrafast lesson in driver form: every action result carries
+    a fresh post-action frame, so consecutive actions need no LOOK round
+    between them."""
 
-    def test_second_action_without_screenshot_is_refused(self):
+    def test_action_result_carries_frame_and_saves_the_look_round(self):
         self.script = [
             {"content": [tu("screenshot")]},
             {"content": [tu("click", {"x": 1, "y": 1})]},
-            {"content": [tu("type_text", {"text": "hi"})]},         # refused: stale frame
-            {"content": [tu("screenshot")]},
-            {"content": [tu("type_text", {"text": "hi"})]},         # admitted
+            {"content": [tu("type_text", {"text": "hi"})]},   # admitted on the piggybacked frame
             {"content": [txt(FINAL_REPORT)]},
         ]
         rc, out = self.run_main()
         self.assertEqual(rc, 0)
         entry = self.telemetry()[-1]
+        self.assertEqual(entry["status"], "reported")
         self.assertEqual(entry["actions"], 2)
-        self.assertGreaterEqual(entry["refusals"], 1)
+        # 4 model turns total: no extra round was spent on a LOOK screenshot
+        self.assertEqual(self.model_calls, 4)
+
+
+class PostActionFrame(unittest.TestCase):
+
+    def test_returns_screenshot_blocks_after_settle(self):
+        real = M.do_screenshot
+        M.do_screenshot = lambda a: [{"type": "image", "source": {"type": "base64", "data": "x"}}]
+        self.addCleanup(setattr, M, "do_screenshot", real)
+        blocks = M.post_action_frame()
+        self.assertEqual(blocks[0]["type"], "image")
+
+    def test_failed_capture_returns_error_text_not_crash(self):
+        real = M.do_screenshot
+        M.do_screenshot = lambda a: [{"type": "text", "text": "screenshot failed: x"}]
+        self.addCleanup(setattr, M, "do_screenshot", real)
+        blocks = M.post_action_frame()
+        self.assertEqual(blocks[0]["type"], "text")
+
+
+class ExecutorValidation(unittest.TestCase):
+    """Model-emitted geometry and keys are validated before they can become
+    input events, the pixel analogue of jev-ultrafast's choice validation."""
+
+    def setUp(self):
+        self._screen, self._lcu = M.SCREEN.copy(), M.lcu
+        M.SCREEN.update({"w": 1000, "h": 800})
+        M.lcu = lambda *a: {"ok": True, "did": a[0]}
+        self.addCleanup(lambda: (M.SCREEN.clear() or M.SCREEN.update(self._screen), setattr(M, "lcu", self._lcu)))
+
+    def test_in_bounds_click_passes(self):
+        blocks, _ = M.run_tool("click", {"x": 10, "y": 790})
+        self.assertTrue(json.loads(blocks[0]["text"])["ok"])
+
+    def test_out_of_bounds_click_is_refused(self):
+        for x, y in ((1500, 10), (-5, 10), (10, 800), (99999, 99999)):
+            blocks, _ = M.run_tool("click", {"x": x, "y": y})
+            payload = json.loads(blocks[0]["text"])
+            self.assertFalse(payload["ok"], (x, y))
+            self.assertIn("outside", payload["error"])
+
+    def test_non_numeric_click_is_refused(self):
+        blocks, _ = M.run_tool("click", {"x": "abc", "y": 0})
+        payload = json.loads(blocks[0]["text"])
+        self.assertFalse(payload["ok"])
+        self.assertIn("must be numbers", payload["error"])
+
+    def test_drag_validates_all_four_corners(self):
+        blocks, _ = M.run_tool("drag", {"x1": 0, "y1": 0, "x2": 2000, "y2": 5})
+        payload = json.loads(blocks[0]["text"])
+        self.assertFalse(payload["ok"])
+        self.assertIn("outside", payload["error"])
+
+    def test_scroll_amount_is_capped(self):
+        blocks, _ = M.run_tool("scroll", {"direction": "down", "amount": 99})
+        payload = json.loads(blocks[0]["text"])
+        self.assertFalse(payload["ok"])
+        self.assertIn("1 to", payload["error"])
+        blocks, _ = M.run_tool("scroll", {"direction": "down", "amount": "many"})
+        self.assertFalse(json.loads(blocks[0]["text"])["ok"])
+
+    def test_key_combos_are_token_checked(self):
+        blocks, _ = M.run_tool("press_key", {"keys": ["ctrl+s", "Return"]})
+        self.assertTrue(json.loads(blocks[0]["text"])["ok"])
+        for bad in (["ctrl+s;rm -rf /"], ["x" * 50], ["a+b+c+d+e+f"]):
+            blocks, _ = M.run_tool("press_key", {"keys": bad})
+            payload = json.loads(blocks[0]["text"])
+            self.assertFalse(payload["ok"], bad)
+
+    def test_unknown_screen_disables_bounds_check_only(self):
+        M.SCREEN.update({"w": None, "h": None})
+        blocks, _ = M.run_tool("click", {"x": 99999, "y": 99999})
+        self.assertTrue(json.loads(blocks[0]["text"])["ok"])
+        # key and scroll validation do not depend on the screen size
+        blocks, _ = M.run_tool("press_key", {"keys": ["ctrl+s;rm"]})
+        self.assertFalse(json.loads(blocks[0]["text"])["ok"])
 
 
 class FakeResp:

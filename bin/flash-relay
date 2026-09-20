@@ -49,6 +49,10 @@ LCU_TIMEOUT_S = 60
 # with its own :0 default, browser binaries do not).
 CHILD_ENV = dict(os.environ)
 CHILD_ENV.setdefault("DISPLAY", ":0")
+# learned from the first screenshot result; coordinate validation is
+# impossible before it exists, and the vision gate guarantees no action
+# runs before that first screenshot anyway
+SCREEN = {"w": None, "h": None}
 
 TOOLS = [
     {"name": "screenshot",
@@ -86,7 +90,7 @@ TOOLS = [
 SYSTEM_TEMPLATE = """You are flash-worker, a computer-use worker driving the user's REAL X11 desktop through LCU tools. You execute exactly one bounded GUI subtask (given in the user message), then report. You never talk to the user directly.
 
 # Driver enforcement (structural, not negotiable)
-The driver executes exactly ONE tool call per model turn; extra calls in a turn are refused. Every action (anything except screenshot and list_windows) requires a fresh screenshot result since your last action. The run's FIRST tool call must be one FULL screenshot (no window, no region); nothing else runs before it. Past the action cap ({max_actions} actions) no action executes at all. The bash tool runs an allowlist: single read/oracle commands and GUI app launches only; everything else is refused.
+The driver executes exactly ONE tool call per model turn; extra calls in a turn are refused. Every action (anything except screenshot and list_windows) requires a fresh screenshot result since your last action. The run's FIRST tool call must be one FULL screenshot (no window, no region); nothing else runs before it. Past the action cap ({max_actions} actions) no action executes at all. The bash tool runs an allowlist: single read/oracle commands and GUI app launches only; everything else is refused. Every action result arrives with a fresh post-action screenshot attached by the driver: that frame is your LOOK for the next decision and it satisfies the fresh-frame rule. Take your own screenshot only to zoom, crop a region, or re-check something.
 
 # Vision gate (first frame, every run)
 Your FIRST tool call must be a full screenshot. Two checks on that one frame:
@@ -95,7 +99,7 @@ Your FIRST tool call must be a full screenshot. Two checks on that one frame:
 Both checks apply to EVERY frame of the run, not only the first: any CAPTCHA, attestation, undeclared login wall, or MFA/SSO consent prompt that appears mid-run stops the run the same way. Screenshot it, then report needs-escalation. Never fill first.
 
 # The loop (strict)
-1. LOOK - screenshot before every single action. Never act on a stale frame.
+1. LOOK - a fresh full screenshot rides along with every action result; act only from that frame or one you just took yourself. Never act on a stale frame.
 2. DECIDE - exactly one action that moves the subtask forward.
 3. ACT - issue it alone; the driver refuses batched calls.
 4. VERIFY - screenshot again; confirm the expected change. If it did not happen, do not repeat the same action; re-observe, diagnose, change approach. A changed approach must stay inside AUTHORIZED and the brief; if it would leave them, report needs-escalation instead of improvising.
@@ -283,6 +287,9 @@ def do_screenshot(a: dict) -> list:
     res = lcu(*args)
     if not res.get("ok"):
         return [{"type": "text", "text": f"screenshot failed: {res.get('error')}"}]
+    scr = res.get("screen") if isinstance(res.get("screen"), dict) else {}
+    if isinstance(scr.get("width"), int) and isinstance(scr.get("height"), int):
+        SCREEN["w"], SCREEN["h"] = scr["width"], scr["height"]
     path = res.get("path")
     if not path:
         return [{"type": "text", "text": "screenshot failed: lcu returned no path"}]
@@ -297,6 +304,38 @@ def do_screenshot(a: dict) -> list:
     meta = {k: v for k, v in res.items() if k not in ("ok", "path")}
     return [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}},
             {"type": "text", "text": path + " " + json.dumps(meta)}]
+
+
+POST_ACTION_SETTLE_S = 0.25
+
+
+def post_action_frame() -> list:
+    """The jev-ultrafast lesson: the driver, not the model, pays for the
+    post-action LOOK. One full frame rides along on every action result,
+    so the next decision starts from fresh pixels without burning a model
+    round trip on a screenshot call."""
+    time.sleep(POST_ACTION_SETTLE_S)
+    return do_screenshot({})
+
+
+KEY_COMBO_RE = re.compile(r"[A-Za-z0-9_]+(?:\+[A-Za-z0-9_]+)*")
+SCROLL_MAX = 20
+
+
+def coord_error(x, y):
+    """Executor-side guard, the pixel analogue of jev-ultrafast's choice
+    validation: model-emitted geometry is checked against the observed
+    screen before it can become an input event."""
+    if SCREEN["w"] is None or SCREEN["h"] is None:
+        return None
+    try:
+        xf, yf = float(x), float(y)
+    except (TypeError, ValueError):
+        return f"coordinates must be numbers, got ({x!r}, {y!r})"
+    if not (0 <= xf < SCREEN["w"] and 0 <= yf < SCREEN["h"]):
+        return (f"coordinates ({x}, {y}) are outside the "
+                f"{SCREEN['w']}x{SCREEN['h']} screen; recompute from the latest screenshot")
+    return None
 
 
 # --- bash allowlist ------------------------------------------------------
@@ -412,20 +451,24 @@ class SafetyPolicy:
         return True, ""
 
     def record(self, name, a, blocks):
-        if name == "screenshot" and any(isinstance(b, dict) and b.get("type") == "image" for b in blocks):
-            self.fresh_frame = True
-            if not (a.get("window") or a.get("region")):
-                self.first_frame_taken = True
+        has_frame = any(isinstance(b, dict) and b.get("type") == "image" for b in blocks)
+        if name == "screenshot" and has_frame and not (a.get("window") or a.get("region")):
+            self.first_frame_taken = True
         if is_action_tool(name):
             self.actions += 1
-            self.fresh_frame = False
+            # an action result carries the driver-attached post-action frame,
+            # so the next decision starts fresh without another LOOK round
+            self.fresh_frame = has_frame
+        elif has_frame:
+            self.fresh_frame = True
 
 
 def rounds_cap(max_actions: int) -> int:
     """The loop hard cap. Screenshots are free but each burns a round, and
-    the protocol demands one per action, so a fixed 60 rounds silently
-    became a ~20-action ceiling that killed runs before the budget and
-    before any report. Tie it to the action budget instead."""
+    before the driver attached a post-action frame to every action result
+    the protocol demanded one LOOK round per action, so a fixed 60 rounds
+    silently became a ~20-action ceiling that killed runs before the
+    budget and before any report. Tie it to the action budget instead."""
     return max(60, max_actions * 4 + 10)
 
 
@@ -488,8 +531,12 @@ def run_tool(name: str, a: dict) -> tuple[list, bool]:
                     res = {"ok": False, "error": f"bash command timed out after {BASH_TIMEOUT_S}s and was killed; "
                                                  "it may have partially taken effect; do not retry it blindly"}
         elif name == "click":
-            res = lcu("click", str(a["x"]), str(a["y"]), "--button", a.get("button", "left"),
-                      "--count", str(a.get("count", 1)))
+            err = coord_error(a["x"], a["y"])
+            if err:
+                res = {"ok": False, "error": err}
+            else:
+                res = lcu("click", str(a["x"]), str(a["y"]), "--button", a.get("button", "left"),
+                          "--count", str(a.get("count", 1)))
         elif name == "type_text":
             text = a.get("text")
             if not isinstance(text, str):
@@ -502,6 +549,9 @@ def run_tool(name: str, a: dict) -> tuple[list, bool]:
                     or not all(isinstance(k, str) and k.strip() for k in keys)):
                 res = {"ok": False, "error": "press_key requires keys as an ARRAY of combo strings, "
                                              "e.g. [\"ctrl+s\", \"Return\"]"}
+            elif not all(KEY_COMBO_RE.fullmatch(k) and len(k) <= 40 and k.count("+") <= 4 for k in keys):
+                res = {"ok": False, "error": "press_key combos must look like ctrl+s or Return "
+                                             "(letters, digits, underscore, plus); other tokens are refused"}
             else:
                 res = lcu("key", *keys)
         elif name == "scroll":
@@ -509,12 +559,23 @@ def run_tool(name: str, a: dict) -> tuple[list, bool]:
             if direction not in ("up", "down", "left", "right"):
                 res = {"ok": False, "error": "scroll requires direction: up|down|left|right"}
             else:
-                args = ["scroll", direction, str(a.get("amount", 3))]
-                if a.get("x") is not None and a.get("y") is not None:
-                    args += ["--x", str(a["x"]), "--y", str(a["y"])]
-                res = lcu(*args)
+                try:
+                    amount = int(a.get("amount", 3))
+                except (TypeError, ValueError):
+                    amount = 0
+                if not (1 <= amount <= SCROLL_MAX):
+                    res = {"ok": False, "error": f"scroll amount must be an integer from 1 to {SCROLL_MAX}"}
+                else:
+                    args = ["scroll", direction, str(amount)]
+                    if a.get("x") is not None and a.get("y") is not None:
+                        args += ["--x", str(a["x"]), "--y", str(a["y"])]
+                    res = lcu(*args)
         elif name == "drag":
-            res = lcu("drag", str(a["x1"]), str(a["y1"]), str(a["x2"]), str(a["y2"]))
+            err = coord_error(a["x1"], a["y1"]) or coord_error(a["x2"], a["y2"])
+            if err:
+                res = {"ok": False, "error": err}
+            else:
+                res = lcu("drag", str(a["x1"]), str(a["y1"]), str(a["x2"]), str(a["y2"]))
         elif name == "list_windows":
             res = lcu("windows")
         elif name == "focus_window":
@@ -652,6 +713,8 @@ def main() -> int:
                                     "content": [{"type": "text", "text": "DRIVER refusal: " + reason}]})
                     continue
                 blocks, _ = run_tool(name, a)
+                if is_action_tool(name):
+                    blocks = blocks + post_action_frame()
                 policy.record(name, a, blocks)
                 results.append({"type": "tool_result", "tool_use_id": tid, "content": blocks})
             messages.append({"role": "user", "content": results})

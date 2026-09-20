@@ -114,6 +114,10 @@ Thinking mode is off by default; measured on this endpoint it costs 1.5 to
 deliberation. Turn it on for hard screens. On the reference benchmark (the
 editor smoke test, a 1920x1200 screen) the loop finished in 2m52s at nine
 actions with thinking off, versus 3m45s at nineteen actions with it on.
+The bigger speed lever is structural: the driver attaches a fresh
+screenshot to every action result, so no model round is spent on
+re-observation. An identical ten-action provisioning rehearsal dropped
+from 412 seconds and 25 rounds to 108 seconds and 14 rounds.
 
 The worker's final message is a fixed report: STATUS, STEPS, EVIDENCE,
 PRODUCED, ANOMALIES, RESULT. PRODUCED lists machine-checkable artifacts
@@ -134,8 +138,12 @@ Structural, in the driver, always on:
 - One tool call per model turn; batched calls are refused, so one confused
   turn cannot chain a submit sequence.
 - The first tool call of a run must be a full screenshot, and every action
-  needs a fresh screenshot since the previous one; no acting blind or on
-  stale frames.
+  needs a fresh frame since the previous one; no acting blind or on
+  stale frames. The driver itself attaches a fresh post-action screenshot
+  to every action result, so the loop spends no model round on
+  re-observation, and model-emitted coordinates, key combos, and scroll
+  amounts are validated against the observed screen before they become
+  input events.
 - A hard action cap (brief `ACTION_BUDGET`, default 40): past it, nothing
   executes, no matter what the model emits.
 - The bash tool is an allowlist, not a denylist: one command line, one
