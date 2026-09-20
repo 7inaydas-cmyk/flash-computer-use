@@ -117,8 +117,10 @@ editor smoke test, a 1920x1200 screen) the loop finished in 2m52s at nine
 actions with thinking off, versus 3m45s at nineteen actions with it on.
 The bigger speed lever is structural: the driver attaches a fresh
 screenshot to every action result, so no model round is spent on
-re-observation. An identical ten-action provisioning rehearsal dropped
-from 412 seconds and 25 rounds to 108 seconds and 14 rounds.
+re-observation. On an identical ten-action provisioning rehearsal it
+dropped from 412 seconds and 25 rounds to 108 seconds and 14 rounds, and
+a same-day alternating A/B (three runs per arm, every run oracle
+verified) measured medians of 27 to 15 rounds and 159s to 93s wall.
 
 The worker's final message is a fixed report: STATUS, STEPS, EVIDENCE,
 PRODUCED, ANOMALIES, RESULT. PRODUCED lists machine-checkable artifacts
