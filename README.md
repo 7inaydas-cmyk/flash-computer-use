@@ -119,8 +119,14 @@ The bigger speed lever is structural: the driver attaches a fresh
 screenshot to every action result, so no model round is spent on
 re-observation. On an identical ten-action provisioning rehearsal it
 dropped from 412 seconds and 25 rounds to 108 seconds and 14 rounds, and
-a same-day alternating A/B (three runs per arm, every run oracle
-verified) measured medians of 27 to 15 rounds and 159s to 93s wall.
+a same-day alternating A/B measured medians of 27 to 15 rounds and 159s
+to 93s wall. Across three task classes (provisioning form, editor save,
+read-only audit; 12 runs total, every run oracle verified) the win tracks
+action density: the two action-driving classes cut rounds 27 to 15 and
+wall clock by about 41 percent, while the read-only class is unchanged,
+exactly because attached frames pay per action. The design is the
+jev-ultrafast act-observe lesson applied to X11 pixels; this tool does
+not use TypeSafe's Jev model.
 
 The worker's final message is a fixed report: STATUS, STEPS, EVIDENCE,
 PRODUCED, ANOMALIES, RESULT. PRODUCED lists machine-checkable artifacts
