@@ -799,7 +799,8 @@ class RetryBackoff(SleepPatcher):
 
     def test_429_then_success_retries_and_succeeds(self):
         conn = FakeConn([FakeResp(429, b'{"type":"error"}', retry_after="1"), FakeResp(200, b'{"ok": true}')])
-        self.assertEqual(self._call(conn), {"ok": True})
+        self.assertEqual(self._call(conn),
+                         {"ok": True, "relay_attempts": 2, "relay_backoff_s": 1.0})
 
     def test_persistent_429_reports_rate_limited(self):
         conn = FakeConn([FakeResp(429, b'{"type":"error"}')] * 5)
@@ -827,7 +828,7 @@ class LadderDiscipline(SleepPatcher):
         out = M.call_model("k", [{"role": "user", "content": "hi"}], False, conn,
                            deadline=time.time() + 600, system="s")
         self.assertEqual(self.sleeps, [2])
-        self.assertEqual(out, {"ok": 1})
+        self.assertEqual(out, {"ok": 1, "relay_attempts": 2, "relay_backoff_s": 2.0})
 
     def test_deadline_stops_retrying(self):
         conn = FakeConn([FakeResp(429, b"e")] * 5)

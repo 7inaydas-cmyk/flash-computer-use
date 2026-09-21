@@ -88,30 +88,38 @@ TOOLS = [
      "input_schema": {"type": "object", "required": ["command"], "properties": {"command": {"type": "string"}}}},
 ]
 
-SYSTEM_TEMPLATE = """You are flash-worker, a computer-use worker driving the user's REAL X11 desktop through LCU tools. You execute exactly one bounded GUI subtask (given in the user message), then report. You never talk to the user directly.
+SYSTEM_TEMPLATE = """<!-- protocol sync: 2026-09-22 -->
+You are flash-worker, a computer-use worker driving the user's REAL X11 desktop through LCU tools. You execute exactly one bounded GUI subtask (given in the user message), then report. You never talk to the user directly.
 
 # Driver enforcement (structural, not negotiable)
-The driver executes exactly ONE tool call per model turn; extra calls in a turn are refused. Every action (anything except screenshot and list_windows) requires a fresh screenshot result since your last action. The run's FIRST tool call must be one FULL screenshot (no window, no region); nothing else runs before it. Past the action cap ({max_actions} actions) no action executes at all. The bash tool runs an allowlist: single read/oracle commands and GUI app launches only; everything else is refused. Every action result arrives with a fresh post-action screenshot attached by the driver: that frame is your LOOK for the next decision and it satisfies the fresh-frame rule. Take your own screenshot only to zoom, crop a region, or re-check something.
+The driver executes exactly ONE tool call per model turn; extra calls in a turn are refused, and a refused extra call has still burned the round that issued it: never append a screenshot to an action in one turn, and a click followed by typing is two turns. Every action (anything except screenshot and list_windows) requires a fresh screenshot result since your last action. The run's FIRST tool call must be one FULL screenshot (no window, no region); nothing else runs before it. Past the action cap ({max_actions} actions) no action executes at all. The bash tool runs an allowlist: single read/oracle commands and GUI app launches only; everything else is refused. Every action result arrives with a fresh post-action screenshot attached by the driver: that frame is your LOOK for the next decision and it satisfies the fresh-frame rule. Take your own screenshot only to zoom, crop a region, or re-check something.
 
 # Vision gate (first frame, every run)
 Your FIRST tool call must be a full screenshot. Two checks on that one frame:
 1. If you cannot actually see and describe its contents, STOP and output the report with STATUS: failed and ANOMALIES: "VISION-BROKEN: cannot view images". Never compensate with image processing, crops via bash, or OCR. A blind run must cost one screenshot.
 2. Scan the frame for a CAPTCHA, a no-AI attestation, or a login wall on your target that the brief did not declare. If one is visible, STOP RIGHT THERE: zero typing, zero clicking, zero filling. Output STATUS: needs-escalation naming the gate. (If the brief DECLARES the gate, or the AUTHORIZED: line covers passing it, proceed as briefed.)
-Both checks apply to EVERY frame of the run, not only the first: any CAPTCHA, attestation, undeclared login wall, or MFA/SSO consent prompt that appears mid-run stops the run the same way. Screenshot it, then report needs-escalation. Never fill first.
+Both checks apply to EVERY frame of the run, not only the first: any CAPTCHA, attestation, undeclared login wall, or MFA/SSO consent prompt that appears mid-run stops the run the same way. The frame that shows the gate is the evidence screenshot: report needs-escalation from the frame you have; take a new one only to zoom the gate into legibility. Never fill first.
 
 # The loop (strict)
 1. LOOK - a fresh full screenshot rides along with every action result; act only from that frame or one you just took yourself. Never act on a stale frame.
 2. DECIDE - exactly one action that moves the subtask forward.
 3. ACT - issue it alone; the driver refuses batched calls.
-4. VERIFY - screenshot again; confirm the expected change. If it did not happen, do not repeat the same action; re-observe, diagnose, change approach. A changed approach must stay inside AUTHORIZED and the brief; if it would leave them, report needs-escalation instead of improvising.
+4. VERIFY - confirm the expected change on the frame that arrived with the action result; when no frame arrived with it, take the screenshot yourself. Take another only when no frame you hold can settle the question (page still mid-load, or zoom a region to read typed text or a label). If it did not happen, do not repeat the same action; re-observe, diagnose, change approach. A changed approach must stay inside AUTHORIZED and the brief; if it would leave them, report needs-escalation instead of improvising.
 
 # Accuracy discipline
 - Click coordinates only from the most recent screenshot. Recompute after any scroll, window change, or animation.
 - Small target: capture its region first, compute the coordinate there, offset by the region origin.
-- Ambiguity is a stop, not a choice: if the brief-named option is absent, or two look-alike candidates match it (near-duplicate rows, similarly named entries), do NOT pick the nearest match. Report STATUS: needs-escalation naming the candidates. A wrong-but-completed action is worse than a blocked run.
+- Ambiguity is a stop, not a choice: do NOT pick the nearest match when two look-alike candidates match the brief-named option (near-duplicate rows, similarly named entries). First capture their region at full resolution and re-read it; escalate only if the brief-named option is absent, or still ambiguous after the zoom. Report STATUS: needs-escalation naming the candidates. A wrong-but-completed action is worse than a blocked run.
 - Before typing: focus the right window and click the exact field. After typing, verify the text landed.
 - Prefer keyboard navigation (Tab, arrows, shortcuts) when reliable.
 - Unexpected dialogs or popups: screenshot and read them. Dismiss (Escape) only if clearly cosmetic. If the brief carries CRITICAL: true, do not dismiss or route through anything: report needs-escalation with the screenshot.
+
+# Traps that cost real runs - if-then, not rederive
+- A custom dropdown one click did not toggle: click it, press Down, press Return, then re-check the attached frame.
+- A filename field shows a stale autocomplete tail: shift+End, then Delete, before typing.
+- A dropdown selection was just made: confirm the attached frame shows the named option before the next field.
+- Submit returns to a blank or expired-session login page: report blocked, never refill.
+- A retry must change something nameable (fresh zoom coordinates, input method, path); if nothing nameable changed, stop.
 
 # Forms and irreplaceable state
 - NEVER navigate, reload, refresh, or close a browser tab that contains a filled but unsubmitted form. Open your target site in a NEW tab and leave every other tab exactly as found.
@@ -119,7 +127,7 @@ Both checks apply to EVERY frame of the run, not only the first: any CAPTCHA, at
 - Verify typed values cheaply (field echo, tab order, one screenshot per form section). Per-field screenshot verification is not your job.
 
 # AUTHORIZED is a closed whitelist
-An AUTHORIZED: line names the ONLY non-read-only actions you may perform this run, exactly as worded, and nothing beyond them. If the brief carries no AUTHORIZED: line, every non-read-only action is out of bounds. If you cannot tell whether a planned action is covered by AUTHORIZED, it is not covered: report STATUS: needs-escalation instead of acting.
+An AUTHORIZED: line names the ONLY non-read-only actions you may perform this run, exactly as worded, and nothing beyond them. If the brief carries no AUTHORIZED: line, every non-read-only action is out of bounds. If you cannot tell whether a planned action is covered by AUTHORIZED, it is not covered: report STATUS: needs-escalation instead of acting. The brief's APP line launch command is authorized exactly as written; AUTHORIZED covers everything beyond it.
 
 # Hard prohibitions - report STATUS: needs-escalation instead of doing
 - Typing passwords, tokens, 2FA codes.
@@ -128,21 +136,21 @@ An AUTHORIZED: line names the ONLY non-read-only actions you may perform this ru
 - Deleting files; closing/resizing apps other than your target; sudo; system settings; anything irreversible.
 
 # Budget
-Hard cap: {max_actions} actions, enforced by the driver: past the cap no action executes, so when the driver announces the budget is reached, stop and output your final report immediately. Screenshots are free. Three failed attempts at one goal-step: STOP, report blocked. Do not thrash.
+Hard cap: {max_actions} actions, enforced by the driver: past the cap no action executes, so when the driver announces the budget is reached, stop and output your final report immediately. Screenshots are unlimited in count, but each one you take yourself costs a model round, and a frame that arrived with an action result is already paid for: do not spend a round retaking what arrived. Three failed attempts at one goal-step: STOP, report blocked. Do not thrash.
 
 # Report - your final message MUST be exactly this template
 STATUS: done | blocked | failed | needs-escalation
-STEPS: <number> total
-  - <one line per action, in order>
+FINDINGS: <optional; MANDATORY for read/verify briefs: one line per question the brief asked, each with its verdict and the evidence behind it>
 EVIDENCE:
-  - <paths of key screenshots: initial, final>
+  - <paths of key screenshots: initial, final; on blocked or needs-escalation, the stop frame's path>
 PRODUCED:
   - <machine-checkable artifacts the task created, one per line: file paths, instance or resource ids, sent message ids; "none" if none>
-ANOMALIES: <unexpected things seen or done; "none" if none>
+ANOMALIES: <unexpected things seen or done; on blocked or needs-escalation, name the bound that stopped the run: action budget, wall clock, three failed attempts, or ambiguity; "none" if none>
 RESULT: <one paragraph: end state and whether the brief's acceptance criteria are met>
-FINDINGS: <optional; MANDATORY for read/verify briefs: one line per question the brief asked, each with its verdict and the evidence behind it>
+STEPS: <number> total
+  - <one line per action, in order>
 
-Be honest: a verified "blocked" beats an optimistic "done"; the orchestrator verifies every done claim independently."""
+FINDINGS sits above STEPS so a token ceiling cuts the action log, never the answers. Be honest: a verified "blocked" beats an optimistic "done"; the orchestrator verifies every done claim independently."""
 
 REPORT_REQUIRED_MARKERS = ("STATUS:", "STEPS:", "EVIDENCE:", "PRODUCED:", "ANOMALIES:", "RESULT:")
 
@@ -168,6 +176,27 @@ def api_key() -> str | None:
 
 
 RETRY_LADDER = (5, 15, 30, 45)
+# Per-request socket timeout, recomputed from the remaining wall clock
+# before every attempt (clamped remaining/3 into these bounds): http.client
+# applies the timeout at connect() and a reused socket keeps the one it was
+# opened with, so call_model re-applies it each attempt.
+REQ_TIMEOUT_MIN_S = 30
+REQ_TIMEOUT_MAX_S = 180
+
+
+def tag_call_meta(resp, attempts: int, backoff_total: float) -> dict:
+    """Stamp call_model's retry telemetry onto its return; main() folds
+    these into the run row. The relay_ prefix keeps the keys off the
+    provider's own response fields."""
+    if isinstance(resp, dict):
+        resp["relay_attempts"] = attempts
+        resp["relay_backoff_s"] = round(backoff_total, 1)
+    return resp
+
+
+def token_count(value) -> int:
+    """Provider usage fields are summed as numbers, anything else is 0."""
+    return value if isinstance(value, (int, float)) else 0
 
 
 def call_model(key: str, messages: list, thinking: bool, conn, deadline: float, system: str) -> dict:
@@ -180,7 +209,9 @@ def call_model(key: str, messages: list, thinking: bool, conn, deadline: float, 
     }
     # Thinking (reasoning) costs 1.5-2.5s+ per call on this endpoint. The
     # driving loop is reflexes-over-deliberation - the protocol enforces the
-    # discipline - so it is off unless --thinking is passed.
+    # discipline - so the caller keeps it off and turns it on per call only
+    # after a refusal, a tool error, or a malformed turn; --thinking still
+    # means always-on.
     if not thinking:
         body["thinking"] = {"type": "disabled"}
     payload = json.dumps(body).encode()
@@ -197,18 +228,27 @@ def call_model(key: str, messages: list, thinking: bool, conn, deadline: float, 
     # the caller's deadline (the run's wall clock), passed in by main().
     last_error = "no attempts made"
     backoff_s = RETRY_LADDER[0]
+    backoff_total = 0.0
     for attempt in range(len(RETRY_LADDER) + 1):
         if attempt:
+            backoff_total += backoff_s
             time.sleep(backoff_s)
         try:
+            # re-apply the socket timeout from the remaining budget before
+            # each request: connect() is what reads conn.timeout, and a
+            # reused socket keeps the timeout it was opened with
+            req_timeout = max(REQ_TIMEOUT_MIN_S, min(REQ_TIMEOUT_MAX_S, (deadline - time.time()) / 3))
+            conn.timeout = req_timeout
+            if getattr(conn, "sock", None) is not None:
+                conn.sock.settimeout(req_timeout)
             conn.request("POST", urllib.parse.urlparse(API).path, body=payload, headers=headers)
             with conn.getresponse() as resp:
                 data = resp.read()
             if resp.status == 200:
-                return json.loads(data)
+                return tag_call_meta(json.loads(data), attempt + 1, backoff_total)
             last_error = f"HTTP {resp.status}: {data[:300].decode(errors='replace')}"
             if resp.status != 429 and resp.status < 500:
-                return {"error": last_error, "rate_limited": False}
+                return tag_call_meta({"error": last_error, "rate_limited": False}, attempt + 1, backoff_total)
             retry_after = 0.0
             if hasattr(resp, "getheader"):
                 try:
@@ -217,16 +257,20 @@ def call_model(key: str, messages: list, thinking: bool, conn, deadline: float, 
                     retry_after = 0.0
             backoff_s = min(retry_after, 60) if retry_after else RETRY_LADDER[min(attempt, len(RETRY_LADDER) - 1)]
             if time.time() + backoff_s > deadline:
-                return {"error": last_error, "rate_limited": True}
+                return tag_call_meta({"error": last_error, "rate_limited": True}, attempt + 1, backoff_total)
         except Exception as e:  # noqa: BLE001 - reconnect and retry transports
             last_error = f"transport: {e}"
             backoff_s = RETRY_LADDER[min(attempt, len(RETRY_LADDER) - 1)]
+            # the next sleep is guarded here too, not only on the 429/5xx path
+            if time.time() + backoff_s > deadline:
+                return tag_call_meta({"error": last_error, "rate_limited": False}, attempt + 1, backoff_total)
             try:
                 conn.close()
                 conn.connect()
             except Exception:  # noqa: BLE001 - next attempt will report it
                 pass
-    return {"error": last_error, "rate_limited": "429" in last_error}
+    return tag_call_meta({"error": last_error, "rate_limited": "429" in last_error},
+                         len(RETRY_LADDER) + 1, backoff_total)
 
 
 KEEP_LAST_IMAGES = 2
@@ -434,8 +478,10 @@ class SafetyPolicy:
         tool_input = tool_input if isinstance(tool_input, dict) else {}
         if index_in_turn > 0:
             return False, ("driver rule: one tool call per turn; only the first call of a turn "
-                           "executes and the rest are refused. Re-observe with a screenshot, "
-                           "then issue your next call alone.")
+                           "executes and the rest are refused. When a call in the turn executed, "
+                           "the executed call's result already carries your next frame: re-observe "
+                           "from it and issue your next call alone; otherwise re-observe with a "
+                           "screenshot.")
         if not self.first_frame_taken:
             if name == "screenshot" and not (tool_input.get("window") or tool_input.get("region")):
                 return True, ""
@@ -465,7 +511,7 @@ class SafetyPolicy:
 
 
 def rounds_cap(max_actions: int) -> int:
-    """The loop hard cap. Screenshots are free but each burns a round, and
+    """The loop hard cap. Each self-taken screenshot burns a round, and
     before the driver attached a post-action frame to every action result
     the protocol demanded one LOOK round per action, so a fixed 60 rounds
     silently became a ~20-action ceiling that killed runs before the
@@ -601,9 +647,18 @@ def run_tool(name: str, tool_input: dict) -> tuple[list, bool]:
     return [{"type": "text", "text": json.dumps(res)[:1500]}], is_action_tool(name)
 
 
+KNOWN_FLAGS = ("--max-actions", "--timeout-s", "--tag", "--thinking")
+
+
 def parse_argv(argv: list) -> dict:
     """Numeric flags stay None when absent, so the caller can tell an
-    explicit flag from a default when merging with the brief's budget."""
+    explicit flag from a default when merging with the brief's budget.
+    Unknown flags raise: a silently dropped flag (the kept A/B runner
+    passes --head) would benchmark identical arms while looking different."""
+    unknown = [a for a in argv if isinstance(a, str) and a.startswith("--") and a not in KNOWN_FLAGS]
+    if unknown:
+        raise ValueError(f"flash-relay: unknown flag(s): {' '.join(unknown)}; "
+                         "supported: --max-actions N, --timeout-s S, --tag T, --thinking")
     out = {"max_actions": None, "timeout_s": None, "thinking": False, "tag": ""}
 
     def flag_value(flag):
@@ -666,7 +721,12 @@ def main() -> int:
         print("usage: flash-relay <brief-file> [--max-actions N] [--timeout-s S] [--thinking]", file=sys.stderr)
         record_run(RUNS_LOG, run_row(brief_path, "", "failed-usage"))
         return 2
-    options = parse_argv(sys.argv[2:])
+    try:
+        options = parse_argv(sys.argv[2:])
+    except ValueError as e:
+        print(str(e), file=sys.stderr)
+        record_run(RUNS_LOG, run_row(brief_path, "", "failed-usage"))
+        return 2
     tag = options["tag"]
     try:
         with open(brief_path) as fh:
@@ -687,12 +747,21 @@ def main() -> int:
     t0, rounds = time.time(), 0
     malformed_turns = 0
     template_nudged = False
+    think_next = False
+    tokens_in = tokens_out = cache_read = cache_creation = 0
+    model_rounds_s = 0.0
+    retries = 0
+    backoff_s_total = 0.0
     cap = rounds_cap(max_actions)
 
     def log_run(status, extra=None):
         record_run(RUNS_LOG, run_row(brief_path, tag, status, {
             "actions": policy.actions, "rounds": rounds,
             "refusals": policy.refusals, "max_actions": max_actions,
+            "tokens_in": tokens_in, "tokens_out": tokens_out,
+            "cache_read": cache_read, "cache_creation": cache_creation,
+            "mean_model_round_s": round(model_rounds_s / rounds, 2) if rounds else 0.0,
+            "retries": retries, "backoff_s": round(backoff_s_total, 1),
             "duration_s": round(time.time() - t0, 1), **(extra or {})}))
 
     try:
@@ -703,13 +772,26 @@ def main() -> int:
             log_run("failed-no-key")
             return 2
         system = build_system(max_actions)
-        conn = http.client.HTTPSConnection(urllib.parse.urlparse(API).netloc, timeout=180)
+        conn = http.client.HTTPSConnection(urllib.parse.urlparse(API).netloc, timeout=REQ_TIMEOUT_MAX_S)
         messages = [{"role": "user", "content": brief}]
         budget_announced = False
         while rounds < cap and time.time() - t0 < timeout_s:
             prune_old_images(messages)
-            resp = call_model(key, messages, thinking, conn, deadline=t0 + timeout_s, system=system)
+            # thinking only when --thinking forces it or the previous round
+            # hit trouble; the vision-gate round has no previous round, so
+            # it stays reflex-fast
+            call_t0 = time.time()
+            resp = call_model(key, messages, thinking or think_next, conn, deadline=t0 + timeout_s, system=system)
+            model_rounds_s += time.time() - call_t0
             rounds += 1
+            think_next = False
+            retries += max(0, (resp.get("relay_attempts") or 1) - 1)
+            backoff_s_total += resp.get("relay_backoff_s") or 0.0
+            usage = resp.get("usage") if isinstance(resp.get("usage"), dict) else {}
+            tokens_in += token_count(usage.get("input_tokens"))
+            tokens_out += token_count(usage.get("output_tokens"))
+            cache_read += token_count(usage.get("cache_read_input_tokens"))
+            cache_creation += token_count(usage.get("cache_creation_input_tokens"))
             if resp.get("error") or resp.get("type") == "error":
                 kind = "rate-limited" if resp.get("rate_limited") else "api-error"
                 print(f"DRIVER: API error ({kind}): {json.dumps(resp)[:400]}")
@@ -736,10 +818,11 @@ def main() -> int:
                     template_nudged = True
                     messages.append({"role": "user", "content":
                         "DRIVER: final message must follow the standing report template "
-                        "(STATUS/STEPS/EVIDENCE/PRODUCED/ANOMALIES/RESULT, plus FINDINGS when the brief asked questions). "
+                        "(STATUS/FINDINGS/EVIDENCE/PRODUCED/ANOMALIES/RESULT/STEPS; FINDINGS is mandatory when the brief asked questions). "
                         "Output it now."})
                     continue
                 malformed_turns += 1
+                think_next = True
                 if malformed_turns >= 3:
                     print("DRIVER: three model turns with no usable content; aborting.")
                     print(fallback_report("failed", 0, "empty model turns", "no usable output"))
@@ -760,6 +843,7 @@ def main() -> int:
                 allowed, reason = policy.admit(name, tool_input, i)
                 if not allowed:
                     policy.refusals += 1
+                    think_next = True
                     results.append({"type": "tool_result", "tool_use_id": tid, "is_error": True,
                                     "content": [{"type": "text", "text": "DRIVER refusal: " + reason}]})
                     continue
@@ -771,6 +855,7 @@ def main() -> int:
                 tool_result = {"type": "tool_result", "tool_use_id": tid, "content": blocks}
                 if errored:
                     tool_result["is_error"] = True
+                    think_next = True
                 results.append(tool_result)
             messages.append({"role": "user", "content": results})
             if policy.actions >= max_actions and not budget_announced:

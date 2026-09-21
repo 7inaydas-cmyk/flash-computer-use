@@ -83,8 +83,13 @@ def cmd_screenshot(args):
         geom = f"{rw}x{rh}"
         grab = f"{DISPLAY}+{rx},{ry}"
         region = {"x": rx, "y": ry, "width": rw, "height": rh}
+    if args.delay:
+        time.sleep(args.delay)
+
     if args.window:
-        wid = resolve_window(args.window)
+        wid = resolve_window(args.window, visible_only=True)
+        # Read after the delay: the window can move or resize while we wait,
+        # and the reported region must describe the pixels actually grabbed.
         info = window_geometry(wid)
         # GTK client-side decorations report shadow offsets that can fall off
         # screen; x11grab rejects negative origins and out-of-bounds sizes.
@@ -95,9 +100,6 @@ def cmd_screenshot(args):
         geom = f"{info['width']}x{info['height']}"
         grab = f"{DISPLAY}+{info['x']},{info['y']}"
         region = info
-
-    if args.delay:
-        time.sleep(args.delay)
 
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
            "-f", "x11grab", "-video_size", geom, "-i", grab, "-frames:v", "1"]
@@ -111,12 +113,20 @@ def cmd_screenshot(args):
 
     out = {"path": path, "screen": {"width": w, "height": h},
            "bytes": os.path.getsize(path)}
-    if args.scale and args.scale != 1.0:
+    scaled = bool(args.scale and args.scale != 1.0)
+    if scaled:
         out["scale"] = args.scale
-        out["note"] = (f"image is scaled {args.scale}x; divide image coords by "
-                       f"{args.scale} to get real screen coords")
     if region:
         out["region"] = region
+    if scaled and region:
+        out["note"] = (f"image is scaled {args.scale}x and capture-relative; "
+                       f"divide image coords by {args.scale}, then add the "
+                       f"region origin ({region['x']},{region['y']}) for "
+                       "absolute screen coords")
+    elif scaled:
+        out["note"] = (f"image is scaled {args.scale}x; divide image coords by "
+                       f"{args.scale} to get real screen coords")
+    elif region:
         out["note"] = ("coords in this image are capture-relative; add region x/y "
                        "for absolute screen coords")
     emit(**out)
@@ -131,7 +141,7 @@ def window_geometry(wid: str) -> dict:
             "width": int(vals["WIDTH"]), "height": int(vals["HEIGHT"])}
 
 
-def resolve_window(spec: str) -> str:
+def resolve_window(spec: str, visible_only: bool = False) -> str:
     """Accept 'active', a numeric window id, or a title substring.
 
     The spec is regex-escaped, so it matches literally as a substring
@@ -139,12 +149,19 @@ def resolve_window(spec: str) -> str:
     Ambiguous matches are an error, not a silent pick: single-instance
     GNOME apps own several windows from one process, and "the last match"
     has focused the wrong window before. Use an exact id from `lcu windows`.
+    visible_only restricts the name search to windows currently on screen,
+    so a capture cannot bind to a minimized window; focus leaves it off
+    because raising hidden windows is its job.
     """
     if spec == "active":
         return run(["xdotool", "getactivewindow"])
     if spec.isdigit():
         return spec
-    out = run(["xdotool", "search", "--name", re.escape(spec)], check=False)
+    search = ["xdotool", "search"]
+    if visible_only:
+        search.append("--onlyvisible")
+    search += ["--name", re.escape(spec)]
+    out = run(search, check=False)
     ids = [line.strip() for line in out.splitlines() if line.strip()]
     if not ids:
         die(f"no window matching name: {spec}")
@@ -186,7 +203,9 @@ def cmd_focus(args):
     wid = resolve_window(args.window)
     run(["xdotool", "windowactivate", "--sync", wid])
     time.sleep(0.3)
-    emit(focused=wid, name=run(["xdotool", "getwindowname", wid], check=False))
+    active = run(["xdotool", "getactivewindow"], check=False)
+    emit(focused=wid, active=active, match=active == wid,
+         name=run(["xdotool", "getwindowname", wid], check=False))
 
 
 # --- point -------------------------------------------------------------

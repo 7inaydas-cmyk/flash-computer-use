@@ -18,10 +18,13 @@ Two-tier computer use: **you** (GLM 5.3 max effort) plan, gate, and verify;
   `~/.zcode/cli/config.json`, so both you and the worker may use
   `mcp__lcu__*` tools.
 - Worker: the `flash-worker` subagent profile
-  (`~/.zcode/agents/flash-worker.md`, `model: GLM-5.3-Flash`). It carries
-  its own driving protocol (fresh-frame anchoring, zoom via
-  `--region`, focus-before-typing, budget discipline) and the report
-  template. Read that file if you need to know exactly what it will do.
+  (`~/.zcode/agents/flash-worker.md`, `model: GLM-5.3-Flash`). Two protocol
+  copies exist (protocol sync: 2026-09-22): relay runs follow the protocol
+  embedded in the `flash-relay` driver (its SYSTEM_TEMPLATE), and the
+  profile governs desktop spawns only. Both carry the same doctrine
+  (attached-frame verify, zoom via `--region`, focus-before-typing, budget
+  discipline) and the report template. Read the copy for your dispatch path
+  if you need to know exactly what the worker will do.
 - Target: the user's real X11 desktop, `DISPLAY :0`. The worker's pointer
   actions move the real cursor and steal focus, so warn the user to be hands-off
   for the duration of a run.
@@ -89,7 +92,9 @@ exactly this: it stopped and is waiting on a human decision relayed by you.
   `subagent_type: flash-worker`, but the desktop runtime has been observed
   to drop profile model pins and silently run the worker on the session's
   text-only model; until a desktop spawn passes the model assertion below,
-  treat `flash-relay` as the only proven path.
+  treat `flash-relay` as the only proven path. A desktop spawn follows the
+  profile's protocol; a relay run follows the driver's embedded protocol
+  (protocol sync: 2026-09-22).
 - **Model assertion (mandatory after every profile-based spawn; not needed
   for flash-relay runs)**: verify the child session actually ran
   GLM-5.3-Flash before trusting anything it reports:
@@ -205,6 +210,9 @@ choosing):
 - GNOME Text Editor's --new-window can RESTORE the user's saved drafts
   into the worker's instance. Check what restored before typing; open a
   genuinely fresh document (ctrl+n) instead of using the restored buffer.
+- Browser-heavy briefs: pre-authorize the needed navigation and download
+  patterns in AUTHORIZED and hand direct URLs, so each refusal does not
+  trigger a fresh look loop.
 
 ## Unattended-desktop mode (user is remote)
 
@@ -234,8 +242,9 @@ suspect, and the user may be nowhere near the desk.
 
 ## Worker report interpretation
 
-The worker's final message is `STATUS / STEPS / EVIDENCE / PRODUCED /
-ANOMALIES / RESULT` (plus `FINDINGS` when the brief asked questions).
+The worker's final message must contain `STATUS`, `FINDINGS`, `EVIDENCE`,
+`PRODUCED`, `ANOMALIES`, `RESULT`, and `STEPS`; `FINDINGS` is mandatory
+when the brief asked questions.
 PRODUCED carries the machine-checkable artifacts the task created; verify
 those against an oracle. Treat `ANOMALIES` seriously: anything the worker clicked that the
 brief did not ask for deserves your verification attention. If the report
