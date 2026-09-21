@@ -100,9 +100,9 @@ CRITICAL: true only for irreversible or spend-bearing tasks
 ```
 
 The driver reads `ACTION_BUDGET` from the brief (the `--max-actions` flag
-overrides it, values clamp to 1..200) and stops executing actions the
-moment the cap is hit, so the number in the brief and the number enforced
-are always the same.
+overrides it, and whichever way the number arrives it clamps to 1..200)
+and stops executing actions the moment the cap is hit, so the number in
+play and the number enforced are always the same.
 
 Run it, hands off the mouse and keyboard until it finishes:
 
@@ -121,7 +121,8 @@ re-observation. On an identical ten-action provisioning rehearsal it
 dropped from 412 seconds and 25 rounds to 108 seconds and 14 rounds, and
 a same-day alternating A/B measured medians of 27 to 15 rounds and 159s
 to 93s wall. Across three task classes (provisioning form, editor save,
-read-only audit; 12 runs total, every run oracle verified) the win tracks
+read-only audit; 12 oracle-verified runs counted out of 15 recorded, the
+other three documented as discarded or excluded samples) the win tracks
 action density: the two action-driving classes cut rounds 27 to 15 and
 wall clock by about 41 percent, while the read-only class is unchanged,
 exactly because attached frames pay per action. The design is the
@@ -156,8 +157,8 @@ Structural, in the driver, always on:
 - A hard action cap (brief `ACTION_BUDGET`, default 40): past it, nothing
   executes, no matter what the model emits.
 - The bash tool is an allowlist, not a denylist: one command line, one
-  allowed binary (read/oracle commands such as cat, ls, grep, pgrep; GUI
-  launchers), no pipes, redirection, expansion, or chaining, executed
+  allowed binary (a nohup prefix is permitted for launches), read/oracle
+  commands such as cat, ls, grep, pgrep and GUI launchers, with no pipes, redirection, expansion, or chaining, executed
   without a shell. An `aws`, `terraform`, `python3`, or `xdotool` command
   is refused outright.
 - Crash guards: malformed model turns and tool errors become tool errors

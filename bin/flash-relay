@@ -151,7 +151,7 @@ def build_system(max_actions: int) -> str:
     return SYSTEM_TEMPLATE.format(max_actions=max_actions)
 
 
-def api_key():
+def api_key() -> str | None:
     # Primary: the CLI config provider record. Fallback: the ZCode desktop
     # app's provider store, which is where a fresh install keeps its key.
     # Returns None on failure: the caller reports and writes telemetry,
@@ -286,17 +286,20 @@ def do_screenshot(tool_input: dict) -> list:
         args += ["--scale", str(tool_input["scale"])]
     res = lcu(*args)
     if not res.get("ok"):
-        return [{"type": "text", "text": f"screenshot failed: {res.get('error')}"}]
+        return [{"type": "text", "text": json.dumps(
+            {"ok": False, "error": f"screenshot failed: {res.get('error')}"})}]
     scr = res.get("screen") if isinstance(res.get("screen"), dict) else {}
     if isinstance(scr.get("width"), int) and isinstance(scr.get("height"), int):
         SCREEN["width"], SCREEN["height"] = scr["width"], scr["height"]
     path = res.get("path")
     if not path:
-        return [{"type": "text", "text": "screenshot failed: lcu returned no path"}]
+        return [{"type": "text", "text": json.dumps(
+            {"ok": False, "error": "screenshot failed: lcu returned no path"})}]
     try:
         size = os.path.getsize(path)
     except OSError as e:
-        return [{"type": "text", "text": f"screenshot failed: {e}"}]
+        return [{"type": "text", "text": json.dumps(
+            {"ok": False, "error": f"screenshot failed: {e}"})}]
     if size > 4_000_000:
         return [{"type": "text", "text": f"screenshot too large ({size} bytes); retry with scale. Saved {path}"}]
     with open(path, "rb") as fh:
@@ -482,6 +485,17 @@ def record_run(runs_path: str, entry: dict) -> None:
         pass  # telemetry must never kill a run
 
 
+def run_row(brief_path, tag, status, extra=None) -> dict:
+    """The one shape of a telemetry row; every exit path builds it here,
+    from the earliest usage failure to the final report."""
+    row = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+           "brief": os.path.abspath(brief_path) if brief_path else "",
+           "tag": tag, "status": status}
+    if extra:
+        row.update(extra)
+    return row
+
+
 def launch_app(argv: list) -> dict:
     """Start a GUI app detached and check it survived the first moments.
 
@@ -508,7 +522,7 @@ def launch_app(argv: list) -> dict:
 def run_tool(name: str, tool_input: dict) -> tuple[list, bool]:
     """Execute one admitted tool call; returns (content blocks, counts_as_action).
 
-    A malformed or hostile call is reported back to the model as tool_input tool
+    A malformed or hostile call is reported back to the model as a tool
     error so it can retry correctly; nothing here may raise.
     """
     try:
@@ -538,7 +552,7 @@ def run_tool(name: str, tool_input: dict) -> tuple[list, bool]:
         elif name == "type_text":
             text = tool_input.get("text")
             if not isinstance(text, str):
-                res = {"ok": False, "error": "type_text requires text as tool_input string"}
+                res = {"ok": False, "error": "type_text requires text as a string"}
             else:
                 res = lcu("type", text)
         elif name == "press_key":
@@ -582,7 +596,7 @@ def run_tool(name: str, tool_input: dict) -> tuple[list, bool]:
             res = {"ok": False, "error": f"unknown tool {name}"}
     except KeyError as e:
         res = {"ok": False, "error": f"malformed tool call: missing required parameter {e}; retry with all required parameters"}
-    except Exception as e:  # noqa: BLE001 - tool_input tool error must never crash the run
+    except Exception as e:  # noqa: BLE001 - a tool error must never crash the run
         res = {"ok": False, "error": f"tool error ({type(e).__name__}): {e}"}
     return [{"type": "text", "text": json.dumps(res)[:1500]}], is_action_tool(name)
 
@@ -610,13 +624,15 @@ def parse_argv(argv: list) -> dict:
 
 def resolve_budget(brief: str, parsed: dict) -> dict:
     """One source of truth for the cap: an explicit flag wins, else the
-    brief's ACTION_BUDGET line, else the default. The SYSTEM prompt and
-    the enforcement code therefore always agree on the number."""
+    brief's ACTION_BUDGET line, else the default. The result is clamped
+    to 1..200 whichever way it came, so the SYSTEM prompt and the
+    enforcement code always agree on the number."""
     out = dict(parsed)
     m = re.search(r"^ACTION_BUDGET:\s*(\d+)", brief, re.MULTILINE)
-    brief_n = min(200, max(1, int(m.group(1)))) if m else None
     if out["max_actions"] is None:
-        out["max_actions"] = brief_n if brief_n is not None else DEFAULT_MAX_ACTIONS
+        out["max_actions"] = int(m.group(1)) if m else DEFAULT_MAX_ACTIONS
+    if not (1 <= out["max_actions"] <= 200):
+        out["max_actions"] = min(200, max(1, out["max_actions"]))
     if out["timeout_s"] is None:
         out["timeout_s"] = DEFAULT_TIMEOUT_S
     return out
@@ -633,17 +649,22 @@ def result_is_error(blocks) -> bool:
         first = blocks[0]
         return (isinstance(first, dict) and first.get("type") == "text"
                 and not json.loads(first["text"]).get("ok", True))
-    except (IndexError, KeyError, TypeError, ValueError):
+    except (IndexError, KeyError, TypeError, ValueError, AttributeError):
         return False
+
+
+def fallback_report(status: str, steps: int, anomalies: str, result: str) -> str:
+    """Every driver-abort report is template-compliant, so even abort
+    output carries the same six markers the final report needs."""
+    return ("STATUS: %s\nSTEPS: %d\nEVIDENCE: n/a\nPRODUCED: none\n"
+            "ANOMALIES: %s\nRESULT: %s" % (status, steps, anomalies, result))
 
 
 def main() -> int:
     brief_path = sys.argv[1] if len(sys.argv) > 1 else None
     if not brief_path or not os.path.exists(brief_path):
         print("usage: flash-relay <brief-file> [--max-actions N] [--timeout-s S] [--thinking]", file=sys.stderr)
-        record_run(RUNS_LOG, {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                              "brief": os.path.abspath(brief_path) if brief_path else "",
-                              "tag": "", "status": "failed-usage"})
+        record_run(RUNS_LOG, run_row(brief_path, "", "failed-usage"))
         return 2
     options = parse_argv(sys.argv[2:])
     tag = options["tag"]
@@ -652,10 +673,12 @@ def main() -> int:
             brief = fh.read().strip()
     except OSError as e:
         print(f"flash-relay: cannot read brief: {e}", file=sys.stderr)
-        record_run(RUNS_LOG, {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                              "brief": os.path.abspath(brief_path), "tag": tag,
-                              "status": "failed-brief-read", "error": str(e)[:160]})
+        record_run(RUNS_LOG, run_row(brief_path, tag, "failed-brief-read",
+                                     {"error": str(e)[:160]}))
         return 2
+    except KeyboardInterrupt:
+        record_run(RUNS_LOG, run_row(brief_path, tag, "interrupted"))
+        return 130
     options = resolve_budget(brief, options)
     max_actions, timeout_s = options["max_actions"], options["timeout_s"]
     thinking = options["thinking"]
@@ -667,23 +690,21 @@ def main() -> int:
     cap = rounds_cap(max_actions)
 
     def log_run(status, extra=None):
-        record_run(RUNS_LOG, {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                              "brief": os.path.abspath(brief_path), "tag": tag,
-                              "actions": policy.actions, "rounds": rounds,
-                              "refusals": policy.refusals, "max_actions": max_actions,
-                              "duration_s": round(time.time() - t0, 1),
-                              "status": status, **(extra or {})})
-    key = api_key()
-    if not key:
-        print("flash-relay: no Z.ai provider key found in ~/.zcode/cli/config.json "
-              "or ~/.zcode/v2/config.json (see README, Install)", file=sys.stderr)
-        log_run("failed-no-key")
-        return 2
-    system = build_system(max_actions)
-    conn = http.client.HTTPSConnection(urllib.parse.urlparse(API).netloc, timeout=180)
-    messages = [{"role": "user", "content": brief}]
+        record_run(RUNS_LOG, run_row(brief_path, tag, status, {
+            "actions": policy.actions, "rounds": rounds,
+            "refusals": policy.refusals, "max_actions": max_actions,
+            "duration_s": round(time.time() - t0, 1), **(extra or {})}))
 
     try:
+        key = api_key()
+        if not key:
+            print("flash-relay: no Z.ai provider key found in ~/.zcode/cli/config.json "
+                  "or ~/.zcode/v2/config.json (see README, Install)", file=sys.stderr)
+            log_run("failed-no-key")
+            return 2
+        system = build_system(max_actions)
+        conn = http.client.HTTPSConnection(urllib.parse.urlparse(API).netloc, timeout=180)
+        messages = [{"role": "user", "content": brief}]
         budget_announced = False
         while rounds < cap and time.time() - t0 < timeout_s:
             prune_old_images(messages)
@@ -695,7 +716,8 @@ def main() -> int:
                 if kind == "rate-limited":
                     print("DRIVER: the plan's request quota window is exhausted; wait ~60s before the next run.")
                 log_run("failed-" + kind, extra={"error": str(resp.get("error"))[:160]})
-                print("STATUS: failed\nSTEPS: %d\nEVIDENCE: n/a\nANOMALIES: %s after %d actions\nRESULT: run aborted on API failure" % (policy.actions, kind, policy.actions))
+                print(fallback_report("failed", policy.actions, f"{kind} after {policy.actions} actions",
+                                      "run aborted on API failure"))
                 return 1
             content = resp.get("content")
             if not isinstance(content, list):
@@ -720,7 +742,7 @@ def main() -> int:
                 malformed_turns += 1
                 if malformed_turns >= 3:
                     print("DRIVER: three model turns with no usable content; aborting.")
-                    print("STATUS: failed\nSTEPS: 0\nEVIDENCE: n/a\nANOMALIES: empty model turns\nRESULT: no usable output")
+                    print(fallback_report("failed", 0, "empty model turns", "no usable output"))
                     log_run("failed-empty-turns")
                     return 1
                 messages.append({"role": "user", "content":
@@ -763,17 +785,18 @@ def main() -> int:
                 messages.append({"role": "user", "content":
                     "DRIVER: conversation round budget nearly exhausted. Output your final report now."})
         print("DRIVER: budget/rounds exhausted without a final report.")
-        print("STATUS: blocked\nSTEPS: %d\nEVIDENCE: n/a\nANOMALIES: driver budget exhausted\nRESULT: no final report produced" % policy.actions)
+        print(fallback_report("blocked", policy.actions, "driver budget exhausted",
+                              "no final report produced"))
         log_run("exhausted-no-report")
         return 1
     except KeyboardInterrupt:
         print("DRIVER: interrupted")
-        print("STATUS: failed\nSTEPS: %d\nEVIDENCE: n/a\nANOMALIES: interrupted\nRESULT: run aborted by interrupt" % policy.actions)
+        print(fallback_report("failed", policy.actions, "interrupted", "run aborted by interrupt"))
         log_run("interrupted")
         return 130
     except Exception as e:  # noqa: BLE001 - a driver bug must still report and log
         print(f"DRIVER: internal error: {type(e).__name__}: {e}")
-        print("STATUS: failed\nSTEPS: %d\nEVIDENCE: n/a\nANOMALIES: driver internal error\nRESULT: run aborted" % policy.actions)
+        print(fallback_report("failed", policy.actions, "driver internal error", "run aborted"))
         log_run("crashed", extra={"error": f"{type(e).__name__}: {e}"[:160]})
         return 1
 

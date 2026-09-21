@@ -135,6 +135,17 @@ class CrashGuard(unittest.TestCase):
         self.assertFalse(payload["ok"])
         self.assertIn("unknown tool", payload["error"])
 
+    def test_failed_screenshot_payload_is_json_and_flagged(self):
+        real = M.lcu
+        M.lcu = lambda *a: {"ok": False, "error": "boom"}
+        self.addCleanup(setattr, M, "lcu", real)
+        blocks, is_action = M.run_tool("screenshot", {})
+        self.assertFalse(is_action)
+        payload = json.loads(blocks[0]["text"])
+        self.assertFalse(payload["ok"])
+        self.assertIn("boom", payload["error"])
+        self.assertTrue(M.result_is_error(blocks))
+
     def test_bash_timeout_is_reported_not_raised(self):
         real = M.BASH_TIMEOUT_S
         fifo = tempfile.mktemp(prefix="fr-fifo-")
@@ -415,6 +426,13 @@ class BudgetResolution(unittest.TestCase):
         out = M.resolve_budget("ACTION_BUDGET: 40 actions (tight)", M.parse_argv([]))
         self.assertEqual(out["max_actions"], 40)
 
+    def test_flag_value_is_clamped_too(self):
+        # the clamp binds whichever way the number arrives; a runaway
+        # --max-actions flag must not bypass it
+        for raw, want in (("99999", 200), ("0", 1), ("-5", 1)):
+            out = M.resolve_budget("SUBTASK: x\n", M.parse_argv(["--max-actions", raw]))
+            self.assertEqual(out["max_actions"], want, raw)
+
     def test_brief_budget_is_clamped(self):
         out = M.resolve_budget("ACTION_BUDGET: 99999\n", M.parse_argv([]))
         self.assertEqual(out["max_actions"], 200)
@@ -434,9 +452,34 @@ class ReportShape(unittest.TestCase):
     def test_result_is_error_flags_only_json_failures(self):
         self.assertTrue(M.result_is_error([{"type": "text", "text": '{"ok": false}'}]))
         self.assertFalse(M.result_is_error([{"type": "text", "text": '{"ok": true}'}]))
-        self.assertFalse(M.result_is_error([{"type": "text", "text": "screenshot failed: x"}]))
+        self.assertFalse(M.result_is_error([{"type": "text", "text": "screenshot too large; retry with scale"}]))
         self.assertFalse(M.result_is_error([{"type": "image", "source": {}}]))
         self.assertFalse(M.result_is_error([]))
+
+    def test_result_is_error_flags_failed_screenshots(self):
+        payload = json.dumps({"ok": False, "error": "screenshot failed: boom"})
+        self.assertTrue(M.result_is_error([{"type": "text", "text": payload}]))
+
+    def test_result_is_error_survives_non_dict_json(self):
+        self.assertFalse(M.result_is_error([{"type": "text", "text": "[1, 2]"}]))
+
+    def test_fallback_reports_are_template_compliant(self):
+        for status in ("failed", "blocked"):
+            text = M.fallback_report(status, 3, "driver budget exhausted",
+                                     "no final report produced")
+            self.assertTrue(M.looks_like_report(text), status)
+
+
+class RunRow(unittest.TestCase):
+
+    def test_shape_and_extra_merge(self):
+        row = M.run_row("/tmp/b.txt", "t", "failed-usage")
+        self.assertEqual(row["brief"], "/tmp/b.txt")
+        self.assertEqual(row["tag"], "t")
+        self.assertEqual(row["status"], "failed-usage")
+        row2 = M.run_row(None, "", "failed-usage", {"error": "x"})
+        self.assertEqual(row2["brief"], "")
+        self.assertEqual(row2["error"], "x")
 
 
 # --- loop integration: the whole driver against scripted model turns ------
@@ -525,6 +568,17 @@ class LoopHarness(unittest.TestCase):
         rc, _ = self.run_main()
         self.assertEqual(rc, 2)
         self.assertEqual(self.telemetry()[-1]["status"], "failed-no-key")
+
+    def test_interrupt_during_setup_writes_telemetry(self):
+        real = M.api_key
+
+        def boom():
+            raise KeyboardInterrupt
+        M.api_key = boom
+        self.addCleanup(setattr, M, "api_key", real)
+        rc, _ = self.run_main()
+        self.assertEqual(rc, 130)
+        self.assertEqual(self.telemetry()[-1]["status"], "interrupted")
 
     def telemetry(self):
         with open(self.log) as fh:
