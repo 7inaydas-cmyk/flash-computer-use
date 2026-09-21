@@ -54,9 +54,12 @@ The fixes are now structural:
 ## Requirements
 
 - Linux with an X11 session (`echo $XDG_SESSION_TYPE` says x11). No Wayland.
-- ZCode with a working Z.ai coding plan (the driver reads the provider key
-  from `~/.zcode/cli/config.json`).
+- A worker model key, found in this order: `FLASH_RELAY_API_KEY` (environment
+  or config file), then the ZCode stores (`~/.zcode/cli/config.json`, then
+  `~/.zcode/v2/config.json`). A logged-in ZCode install with a working Z.ai
+  coding plan therefore needs no configuration at all.
 - `xdotool`, `ffmpeg`, `xdpyinfo` on PATH, Python 3.10 or newer.
+- For the jev decision head only: a TypeSafe account and key (below).
 
 ## Install
 
@@ -138,6 +141,112 @@ yours. For provisioning-class tasks, verify produced ids against the
 service's own CLI or state; a window title proves nothing about what was
 provisioned.
 
+## Configuration
+
+Zero-config with a logged-in ZCode install. Everything else is optional
+and resolved the same way everywhere: process environment, then a config
+file, then built-in defaults.
+
+The worker-provider config file is `./.env` in the directory you run
+flash-relay from, or any path named by `FLASH_RELAY_ENV` (useful for the
+installed binary, which runs from anywhere). `.env.example` at the repo
+root documents every knob; the file is gitignored and no key ever ships
+in a repo.
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `FLASH_RELAY_PROVIDER` | `http`, `openai`, or `claude-cli` (experimental) | `http` |
+| `FLASH_RELAY_BASE_URL` | endpoint base; the provider appends its path | `https://api.z.ai/api/anthropic` |
+| `FLASH_RELAY_MODEL` | worker model id | `GLM-5.3-Flash` |
+| `FLASH_RELAY_API_KEY` | worker key; falls back to the ZCode stores | ZCode walk |
+| `FLASH_RELAY_CLAUDE_BIN` | claude binary for the claude-cli provider | `claude` |
+| `FLASH_RELAY_HEAD` | decision head: `vision` or `jev` | `vision` |
+
+The `--head` flag overrides `FLASH_RELAY_HEAD` per run.
+
+### Configure your own access
+
+After the clone and install steps above, take exactly as much
+configuration as you need; the first option needs nothing at all.
+
+- Zero config, Z.ai default: with a logged-in ZCode install, just run
+  `flash-relay mytask.txt`. The key comes from the ZCode stores and the
+  worker runs GLM-5.3-Flash at the Z.ai endpoint.
+- Any other Anthropic-compatible endpoint: `cp .env.example .env` in the
+  directory you run flash-relay from, then uncomment and fill
+  `FLASH_RELAY_BASE_URL`, `FLASH_RELAY_MODEL`, and `FLASH_RELAY_API_KEY`;
+  or export those three variables instead. The environment beats the
+  file.
+- OpenAI-compatible endpoint: same as above plus
+  `FLASH_RELAY_PROVIDER=openai`, with `FLASH_RELAY_BASE_URL` at the
+  endpoint root (the driver appends `/chat/completions`).
+- claude -p: `FLASH_RELAY_PROVIDER=claude-cli`. It needs no key and
+  ignores base url and model; set `FLASH_RELAY_CLAUDE_BIN` if the binary
+  is not on PATH. Experimental and stub-tested only.
+- Enable Jev: run with `--head jev` or set `FLASH_RELAY_HEAD=jev`, and
+  provide a TypeSafe key: `TYPESAFE_API_KEY` exported, or
+  `~/.config/flash-relay/jev.env` (mode 600, never inside a repo tree).
+  The run fails closed at startup without the key or with an unpinned
+  `TYPESAFE_MODEL`.
+- Turn Jev off: run without `--head` and without `FLASH_RELAY_HEAD` set.
+  A present `TYPESAFE_API_KEY` alone never flips the head.
+
+### Model providers
+
+- `http` (default): the Anthropic Messages wire format against
+  `FLASH_RELAY_BASE_URL`. Any Anthropic-compatible endpoint needs only
+  `FLASH_RELAY_BASE_URL` + `FLASH_RELAY_MODEL` + `FLASH_RELAY_API_KEY`;
+  there is no provider value to set.
+- `openai`: a translation sibling for OpenAI-compatible endpoints: tools
+  become function tools, tool results become tool messages, screenshots
+  become `image_url` data URLs, and the reply is translated back into
+  content blocks. Point `FLASH_RELAY_BASE_URL` at the endpoint root.
+- `claude-cli` (experimental): each turn is a `claude -p` subprocess with
+  the transcript as stream-json on stdin and the reply read from the json
+  output. It needs no API key and ignores base url and model. Stub-tested
+  only, never exercised live by the author: treat it as unproven until
+  you have run it once yourself.
+
+### Decision heads
+
+- `vision` (default): the single-model loop described above. The worker
+  model sees the frame, decides, and acts through the full tool list.
+- `jev` (opt-in, `--head jev`): the worker model stays the eyes and the
+  gate-keeper and proposes an indexed candidate table (the `observe`
+  tool, at most 200 executor-legal rows: coordinates from the current
+  frame, key combos, window ids from `list_windows`, GUI-launch bash
+  only, exact brief-declared text). One TypeSafe Jev request
+  (api.typesafe.ai) picks among the offered rows, and the driver
+  executes the chosen row through the same admit/run_tool path as a
+  vision action. The full transcript records what was offered and what
+  was chosen.
+
+Jev invariants: Jev emits only an offered id; coordinates, text, keys,
+and commands originate in the vision-proposed rows, are pre-validated
+with the same validators the executor applies, and are re-validated at
+execution time. The action cap, fresh-frame rule, one-call-per-turn,
+vision gate, bash allowlist, and bounds checks bite identically. The
+model is pinned to a versioned id (default `jev-1.13.0`; `TYPESAFE_MODEL`
+to bump, aliases such as `jev-latest` are refused) and the response's
+model field must match the pin.
+
+Setup: a TypeSafe account, then `TYPESAFE_API_KEY` in the environment or
+in `~/.config/flash-relay/jev.env` (mode 600, never inside a repo tree).
+Optional: `JEV_MIN_CONFIDENCE` (default 0.0; untuned until live data
+exists) and `JEV_MAX_DECISION_AGE_S` (default 45).
+
+Honest bounds of the jev head: a decision may execute on pixels up to
+`JEV_MAX_DECISION_AGE_S` old, because the extraction round plus a retried
+TypeSafe call can stretch the gap (in vision mode the deciding round is
+the round that saw the frame), and each action costs one extraction round
+plus one TypeSafe call, so expect roughly 1.5 to 2x the wall time per
+action. It is a decision-quality and audit head, not a speed head, and
+nothing changes by default. Candidate labels and context are
+vision-written text sent to TypeSafe as a second third party (the same
+exposure class as the frames already sent to the worker endpoint); the
+observe schema forbids transcribing passwords, tokens, or 2FA codes into
+rows.
+
 ## Safety model
 
 Two layers, and the code one does not depend on the model behaving.
@@ -193,6 +302,19 @@ anything else says: stop, and check whether unsaved state was destroyed.
   explicitly main-agent-only. This stack is the pixel-driven alternative;
   if sighted workers disappoint you, that plugin's semantic actions are the
   escape hatch, at the cost of re-validating everything.
+- The jev head is opt-in and unproven on the author's desktop: the TypeSafe
+  integration is offline-tested (fake connections, no network) and has not
+  been live-run. Its request limits (255 options per question, 64k tokens
+  per request), its retry set (429/529/503), and the pinned model id are
+  survey-sourced, enforced conservatively in code (a 200-row candidate cap
+  and a 48k estimated-token guard), and the first live gate is an
+  authenticated model-list check before any spend.
+- The claude-cli provider is stub-tested only and marked experimental until
+  its live one-turn gate; the stream-json envelope and auth state have
+  never been exercised against a real Claude CLI by this project's tests.
+- `./.env` is only found when flash-relay runs with that working directory;
+  use `FLASH_RELAY_ENV` for an absolute path. The zero-config default is
+  unaffected.
 
 ## License
 

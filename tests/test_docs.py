@@ -19,7 +19,10 @@ def repo_files(suffix):
 class DocsStandard(unittest.TestCase):
     def test_no_em_or_en_dashes_in_markdown(self):
         offenders = []
-        for path in repo_files(".md"):
+        # .env.example is covered too: it is shipped prose with a suffix no
+        # .md scan would otherwise reach
+        paths = list(repo_files(".md")) + [os.path.join(REPO, ".env.example")]
+        for path in paths:
             for n, line in enumerate(open(path, encoding="utf-8"), 1):
                 if "\u2014" in line or "\u2013" in line:
                     offenders.append(f"{os.path.relpath(path, REPO)}:{n}")
@@ -31,6 +34,16 @@ class DocsStandard(unittest.TestCase):
         self.assertIn("mirror apiKey", key)
         self.assertNotRegex(key, r"^[0-9a-f]{20,}")
 
+    def test_env_example_covers_every_documented_knob(self):
+        with open(os.path.join(REPO, "README.md"), encoding="utf-8") as fh:
+            readme = fh.read()
+        with open(os.path.join(REPO, ".env.example"), encoding="utf-8") as fh:
+            example = fh.read()
+        knobs = set(re.findall(r"\b(?:FLASH_RELAY|TYPESAFE|JEV)_[A-Z0-9_]+", readme))
+        self.assertTrue(knobs, "knob scan found nothing; the pattern rotted")
+        missing = sorted(k for k in knobs if k not in example)
+        self.assertEqual(missing, [], f".env.example is missing knobs: {missing}")
+
 
 class SecretScan(unittest.TestCase):
     # assembled from fragments so this file cannot match itself
@@ -38,6 +51,7 @@ class SecretScan(unittest.TestCase):
         re.compile("023d44" + "c7"),
         re.compile(r"\bsk-[A-Za-z0-9]{16,}"),
         re.compile(r"\bgho_[A-Za-z0-9]{16,}"),
+        re.compile("api" + "key_[A-Za-z0-9]{16,}"),
         re.compile(r"x-api-key:\s*[0-9a-f]{24}\."),
     )
 
@@ -45,6 +59,7 @@ class SecretScan(unittest.TestCase):
         offenders = []
         paths = (list(repo_files(".py")) + list(repo_files(".sh"))
                  + list(repo_files(".md")) + list(repo_files(".json"))
+                 + [os.path.join(REPO, ".env.example")]
                  + [os.path.join(REPO, "bin", n) for n in ("lcu", "flash-relay")])
         for path in paths:
             text = open(path, encoding="utf-8", errors="replace").read()
